@@ -39,7 +39,10 @@ func main() {
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			log.Println("upgrade error:", err)
+			// Debug: agar upgrade fail ho to yeh exact incoming headers print karega —
+			// isse pata chal jayega ke Connection/Upgrade header network mein kahin
+			// strip ho raha hai ya kuch aur wajah hai.
+			log.Println("upgrade error:", err, "| Connection:", r.Header.Get("Connection"), "| Upgrade:", r.Header.Get("Upgrade"), "| remote:", r.RemoteAddr, "| user-agent:", r.Header.Get("User-Agent"))
 			return
 		}
 
