@@ -1,0 +1,483 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"sync"
+
+	"github.com/gorilla/websocket"
+)
+
+// ==== Matchmaking + room management ====
+//
+// Wants (memory se): sirf same bet-amount wale real online players match
+// hon; agar match na mile to player ko waiting mein hi rakho, timeout laga
+// kar kisi bot/random se match mat karo.
+
+// ClientMsg — client se aane wale saare messages isi shape mein aate hain.
+type ClientMsg struct {
+	Type     string `json:"type"`
+	Email    string `json:"email"`
+	Password string `json:"password"`
+	PlayerID string `json:"player_id"`
+	Name     string `json:"name"`
+	Bet      int    `json:"bet"`
+	Mode     string `json:"mode"`
+	Players  int    `json:"players"` // 2 ya 4
+	Magic    bool   `json:"magic"`
+	Token    int    `json:"token"`
+	Value    int    `json:"value"`
+}
+
+// ServerMsg — server se client ko jane wale saare messages.
+type ServerMsg struct {
+	Type     string    `json:"type"`
+	PlayerID string    `json:"player_id,omitempty"`
+	AuthToken string   `json:"auth_token,omitempty"`
+	RoomID   string    `json:"room_id,omitempty"`
+	Color    Color     `json:"color,omitempty"`
+	Players  []Color   `json:"players,omitempty"`
+	Mode     Mode      `json:"mode,omitempty"`
+	Bet      int       `json:"bet,omitempty"`
+	Coins    int64     `json:"coins,omitempty"`
+	Diamonds int64     `json:"diamonds,omitempty"`
+	State    *Snapshot `json:"state,omitempty"`
+	Events   []Event   `json:"events,omitempty"`
+	Message  string    `json:"message,omitempty"`
+}
+
+type Client struct {
+	id   string
+	name string
+	conn *websocket.Conn
+	send chan []byte
+
+	mu        sync.Mutex
+	authed    bool
+	room      *Room
+	color     Color
+	closeOnce sync.Once
+	closed    bool
+}
+
+// closeSend — channel ko safely (sirf ek dafa) close karta hai, chahe yeh
+// kitni bhi jaghon se call ho (slow-client drop + normal disconnect dono).
+// "closed" flag age ki har sendJSON call ko closed channel par bhejne se rokta hai.
+func (c *Client) closeSend() {
+	c.closeOnce.Do(func() {
+		c.mu.Lock()
+		c.closed = true
+		c.mu.Unlock()
+		close(c.send)
+	})
+}
+
+func (c *Client) writePump() {
+	for msg := range c.send {
+		c.mu.Lock()
+		err := c.conn.WriteMessage(websocket.TextMessage, msg)
+		c.mu.Unlock()
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (c *Client) sendJSON(v interface{}) {
+	c.mu.Lock()
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		return
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
+	select {
+	case c.send <- b:
+	default:
+		// client bahut slow hai / buffer bhar chuka — connection drop hone dete hain
+		go c.closeSend()
+	}
+}
+
+type Room struct {
+	id      string
+	mode    Mode
+	bet     int
+	game    *GameState
+	clients map[Color]*Client
+	mu      sync.Mutex
+}
+
+func (r *Room) broadcast(msg ServerMsg) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, c := range r.clients {
+		c.sendJSON(msg)
+	}
+}
+
+func (r *Room) broadcastExcept(exclude Color, msg ServerMsg) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for color, c := range r.clients {
+		if color == exclude {
+			continue
+		}
+		c.sendJSON(msg)
+	}
+}
+
+type waitKey struct {
+	mode    string
+	bet     int
+	players int
+	magic   bool
+}
+
+type Hub struct {
+	mu      sync.Mutex
+	waiting map[waitKey][]*Client
+	rooms   map[string]*Room
+	roomSeq int
+	store   *Store
+}
+
+func NewHub(store *Store) *Hub {
+	return &Hub{
+		waiting: map[waitKey][]*Client{},
+		rooms:   map[string]*Room{},
+		store:   store,
+	}
+}
+
+// Join — client ko matchmaking queue mein daalta hai. Same mode+bet+player-count
+// wale kaafi log jama hone par turant room bana kar sabko "matched" bhej deta hai.
+// Queue mein daalne se pehle balance check hota hai — bet se kam coins hon to
+// join hi nahi hone dete.
+func (h *Hub) Join(c *Client, mode string, bet int, playerCount int, magic bool) {
+	if bet <= 0 {
+		c.sendJSON(ServerMsg{Type: "error", Message: "bet amount ghalat hai"})
+		return
+	}
+	coins, err := h.store.GetCoins(c.id)
+	if err != nil {
+		c.sendJSON(ServerMsg{Type: "error", Message: "account nahi mila"})
+		return
+	}
+	if coins < int64(bet) {
+		c.sendJSON(ServerMsg{Type: "error", Message: "coins kam hain is bet ke liye", Coins: coins})
+		return
+	}
+
+	if playerCount != 2 && playerCount != 4 {
+		playerCount = 2
+	}
+	m := Mode(mode)
+	switch m {
+	case ModeClassic, ModeArrow, ModeQuick, ModeMaster:
+	default:
+		m = ModeClassic
+	}
+
+	key := waitKey{mode: string(m), bet: bet, players: playerCount, magic: magic}
+
+	h.mu.Lock()
+	h.waiting[key] = append(h.waiting[key], c)
+	queue := h.waiting[key]
+
+	if len(queue) < playerCount {
+		h.mu.Unlock()
+		c.sendJSON(ServerMsg{Type: "waiting", Message: fmt.Sprintf("%d/%d players — same bet ka koi aur player dhoond rahe hain", len(queue), playerCount)})
+		return
+	}
+
+	// poori table mil gayi — queue se nikal kar room banao
+	group := queue[:playerCount]
+	h.waiting[key] = queue[playerCount:]
+	h.roomSeq++
+	roomID := fmt.Sprintf("room-%d", h.roomSeq)
+	h.mu.Unlock()
+
+	colors := PlayerColors2P
+	if playerCount == 4 {
+		colors = PlayerColors4P
+	}
+
+	game := NewGameState(m, colors, magic)
+	room := &Room{id: roomID, mode: m, bet: bet, game: game, clients: map[Color]*Client{}}
+
+	for i, member := range group {
+		color := colors[i]
+		member.mu.Lock()
+		member.room = room
+		member.color = color
+		member.mu.Unlock()
+		room.clients[color] = member
+	}
+
+	h.mu.Lock()
+	h.rooms[roomID] = room
+	h.mu.Unlock()
+
+	// Sabki bet ek sath escrow mein kaat lo — har player ko apna naya (post-deduction) balance milta hai.
+	for _, member := range group {
+		newBal, dErr := h.store.AdjustCoins(member.id, -int64(bet))
+		if dErr != nil {
+			newBal, _ = h.store.GetCoins(member.id)
+			member.sendJSON(ServerMsg{Type: "error", Message: "bet deduct nahi ho saki: " + dErr.Error(), Coins: newBal})
+			continue
+		}
+		member.sendJSON(ServerMsg{
+			Type:    "matched",
+			RoomID:  roomID,
+			Color:   member.color,
+			Players: colors,
+			Mode:    m,
+			Bet:     bet,
+			Coins:   newBal,
+			State:   game.Snapshot(),
+		})
+	}
+}
+
+// LeaveQueue — agar client disconnect ho jaye jabke abhi match nahi mila.
+func (h *Hub) LeaveQueue(c *Client) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for key, q := range h.waiting {
+		for i, m := range q {
+			if m == c {
+				h.waiting[key] = append(q[:i], q[i+1:]...)
+				return
+			}
+		}
+	}
+}
+
+// LeaveRoom — game ke doraan koi disconnect ho jaye to baaki players ko batao.
+func (h *Hub) LeaveRoom(c *Client) {
+	c.mu.Lock()
+	room := c.room
+	color := c.color
+	c.mu.Unlock()
+	if room == nil {
+		return
+	}
+	room.mu.Lock()
+	delete(room.clients, color)
+	empty := len(room.clients) == 0
+	room.mu.Unlock()
+
+	room.broadcastExcept(color, ServerMsg{Type: "opponentLeft", Color: color})
+
+	if empty {
+		h.mu.Lock()
+		delete(h.rooms, room.id)
+		h.mu.Unlock()
+	}
+}
+
+// settleGameOver — agar events mein "gameOver" ho to poora pot (sab players ki
+// bet ka jama) jeetne wale ke account mein credit kar deta hai aur sab clients
+// ko un ka updated balance batata hai.
+func (h *Hub) settleGameOver(room *Room, events []Event) {
+	for _, e := range events {
+		if e.Type != "gameOver" {
+			continue
+		}
+		room.mu.Lock()
+		winnerClient, ok := room.clients[e.Winner]
+		room.mu.Unlock()
+		if !ok {
+			continue
+		}
+		pot := int64(room.bet) * int64(len(room.game.Players))
+		newBal, err := h.store.AdjustCoins(winnerClient.id, pot)
+		if err != nil {
+			log.Println("settleGameOver: credit failed:", err)
+			continue
+		}
+		winnerClient.sendJSON(ServerMsg{Type: "wallet", Color: e.Winner, Coins: newBal, Message: "aap jeet gaye! pot credit ho gaya"})
+		room.broadcastExcept(e.Winner, ServerMsg{Type: "wallet", Color: e.Winner, Message: fmt.Sprintf("%s jeet gaya, pot le gaya", e.Winner)})
+	}
+}
+
+func (h *Hub) handleRoll(c *Client) {
+	c.mu.Lock()
+	room := c.room
+	color := c.color
+	c.mu.Unlock()
+	if room == nil {
+		c.sendJSON(ServerMsg{Type: "error", Message: "not in a game yet"})
+		return
+	}
+	events, err := room.game.RollDice(color)
+	if err != nil {
+		c.sendJSON(ServerMsg{Type: "error", Message: err.Error()})
+		return
+	}
+	room.broadcast(ServerMsg{Type: "events", Events: events, State: room.game.Snapshot()})
+	h.settleGameOver(room, events)
+}
+
+func (h *Hub) handleMove(c *Client, tokenIdx int, value int) {
+	c.mu.Lock()
+	room := c.room
+	color := c.color
+	c.mu.Unlock()
+	if room == nil {
+		c.sendJSON(ServerMsg{Type: "error", Message: "not in a game yet"})
+		return
+	}
+	events, err := room.game.MoveToken(color, tokenIdx, value)
+	if err != nil {
+		c.sendJSON(ServerMsg{Type: "error", Message: err.Error()})
+		return
+	}
+	room.broadcast(ServerMsg{Type: "events", Events: events, State: room.game.Snapshot()})
+	h.settleGameOver(room, events)
+}
+
+// handleBuyExtraRoll — client "buyExtraRoll" bhejta hai (koi extra field nahi
+// chahiye — cost server khud current player ke count/spent se nikalta hai).
+// Diamonds pehle deduct hote hain, tabhi dice roll hota hai; agar kisi wajah
+// se roll fail ho (turn nikal chuka waghera) to diamonds refund ho jate hain.
+func (h *Hub) handleBuyExtraRoll(c *Client) {
+	c.mu.Lock()
+	room := c.room
+	color := c.color
+	c.mu.Unlock()
+	if room == nil {
+		c.sendJSON(ServerMsg{Type: "error", Message: "not in a game yet"})
+		return
+	}
+
+	cost := room.game.NextExtraRollCost(color)
+	if cost == 0 {
+		c.sendJSON(ServerMsg{Type: "error", Message: "is game mein extra-roll ki 1000 diamond limit khatam ho chuki — lock ho gaya"})
+		return
+	}
+
+	newDiamonds, err := h.store.AdjustDiamonds(c.id, -cost)
+	if err != nil {
+		c.sendJSON(ServerMsg{Type: "error", Message: "diamonds kam hain extra-roll ke liye"})
+		return
+	}
+
+	events, err := room.game.BuyExtraRoll(color, cost)
+	if err != nil {
+		// roll fail hui (jaise turn nikal chuka) — kate hue diamonds wapis kar do
+		refunded, _ := h.store.AdjustDiamonds(c.id, cost)
+		c.sendJSON(ServerMsg{Type: "error", Message: err.Error(), Diamonds: refunded})
+		return
+	}
+
+	c.sendJSON(ServerMsg{Type: "wallet", Diamonds: newDiamonds, Message: "extra roll khareeda"})
+	room.broadcast(ServerMsg{Type: "events", Events: events, State: room.game.Snapshot()})
+	h.settleGameOver(room, events)
+}
+
+// handleSignup / handleLogin — asal HTTP endpoints ki jagah ab yeh seedha
+// WebSocket message se hota hai. Kaamyabi par client "authed" ho jata hai aur
+// tabhi "join"/"roll"/"move" bhej sakta hai — is se pehle koi bhi HTTP request
+// nahi lagti, sab isi socket ke andar.
+func (h *Hub) handleSignup(c *Client, email, password string) {
+	if email == "" || password == "" {
+		c.sendJSON(ServerMsg{Type: "error", Message: "email aur password dono zaroori hain"})
+		return
+	}
+	if len(password) < 6 {
+		c.sendJSON(ServerMsg{Type: "error", Message: "password kam se kam 6 characters ka ho"})
+		return
+	}
+	acc, token, err := h.store.SignUp(email, password)
+	if err != nil {
+		c.sendJSON(ServerMsg{Type: "error", Message: err.Error()})
+		return
+	}
+	c.mu.Lock()
+	c.id = acc.ID
+	c.name = acc.Email
+	c.authed = true
+	c.mu.Unlock()
+	c.sendJSON(ServerMsg{Type: "auth", PlayerID: acc.ID, AuthToken: token, Coins: acc.Coins, Diamonds: acc.Diamonds})
+}
+
+func (h *Hub) handleLogin(c *Client, email, password string) {
+	acc, token, err := h.store.Login(email, password)
+	if err != nil {
+		c.sendJSON(ServerMsg{Type: "error", Message: err.Error()})
+		return
+	}
+	c.mu.Lock()
+	c.id = acc.ID
+	c.name = acc.Email
+	c.authed = true
+	c.mu.Unlock()
+	c.sendJSON(ServerMsg{Type: "auth", PlayerID: acc.ID, AuthToken: token, Coins: acc.Coins, Diamonds: acc.Diamonds})
+}
+
+// ReadPump — client se aane wale messages parse karta hai aur route karta hai.
+func (h *Hub) ReadPump(c *Client) {
+	defer func() {
+		h.LeaveQueue(c)
+		h.LeaveRoom(c)
+		c.closeSend()
+		c.conn.Close()
+	}()
+
+	for {
+		_, raw, err := c.conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var msg ClientMsg
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			c.sendJSON(ServerMsg{Type: "error", Message: "bad message format"})
+			continue
+		}
+
+		// signup/login se pehle kuch aur allow nahi — baaki sab isi state par depend karta hai
+		if msg.Type == "signup" {
+			h.handleSignup(c, msg.Email, msg.Password)
+			continue
+		}
+		if msg.Type == "login" {
+			h.handleLogin(c, msg.Email, msg.Password)
+			continue
+		}
+
+		c.mu.Lock()
+		authed := c.authed
+		c.mu.Unlock()
+		if !authed {
+			c.sendJSON(ServerMsg{Type: "error", Message: "pehle signup ya login karein"})
+			continue
+		}
+
+		switch msg.Type {
+		case "join":
+			h.Join(c, msg.Mode, msg.Bet, msg.Players, msg.Magic)
+		case "roll":
+			h.handleRoll(c)
+		case "move":
+			h.handleMove(c, msg.Token, msg.Value)
+		case "buyExtraRoll":
+			h.handleBuyExtraRoll(c)
+		case "leave":
+			h.LeaveQueue(c)
+			h.LeaveRoom(c)
+		default:
+			log.Printf("unknown message type from %s: %s", c.id, msg.Type)
+		}
+	}
+}
