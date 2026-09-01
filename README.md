@@ -85,18 +85,61 @@ milti hai — `0` ka matlab hai us player ke liye is game mein lock ho chuka.
 ```json
 {"type": "error", "message": "..."}
 {"type": "waiting", "message": "1/2 players — same bet ka koi aur player dhoond rahe hain"}
-{"type": "matched", "room_id": "room-1", "color": "RED", "players": ["RED","YELLOW"], "mode": "classic", "bet": 500, "coins": 9500, "state": {...}}
+{"type": "matched", "room_id": "room-1", "color": "RED", "players": ["RED","YELLOW"], "mode": "classic", "bet": 500, "coins": 9500, "state": {...}, "profiles": {"RED": {"name":"Ali","avatar":"https://.../avatars/xxx.jpg"}, "YELLOW": {"name":"Guest","avatar":""}}}
 {"type": "events", "events": [ {"type":"dice","color":"RED","value":6}, ... ], "state": {...}}
 {"type": "wallet", "color": "RED", "coins": 10500, "message": "aap jeet gaye! pot credit ho gaya"}
 {"type": "opponentLeft", "color": "YELLOW"}
+{"type": "opponentProfile", "color": "YELLOW", "name": "Sara", "avatar": "https://.../avatars/yyy.jpg"}
+{"type": "turnTimer", "color": "RED", "seconds": 12}
+{"type": "forceLogout", "message": "aapki ID kisi doosre phone/device par login ho gayi hai — is device se logout kiya ja raha hai"}
 ```
 
 **Bet kab katti/milti hai:** match banते hi (`matched`) har player ki bet
 turant kat jati hai. Game khatam hone par (`gameOver` event) poora pot
 jeetne wale ko `wallet` event ke sath mil jata hai.
 
+## Profile (naam + display picture)
+Auth response (`auth`) aur `matched` message ab har player ka `name`/`avatar`
+(ya doosron ke liye `profiles` map) bhi bhejte hain — is se opponent ki
+profile (naam + DP) game screen par dikhai ja sakti hai.
+
+- Naam/avatar badalne ke liye client bhejta hai:
+  `{"type":"updateProfile","name":"Ali","avatar":"https://.../avatars/xxx.jpg"}`
+- **Avatar kabhi bhi base64/data-URI ke taur par nahi bheja jata** — pehle
+  photo ko `POST /avatar?token=<auth_token>` par raw image bytes ke sath
+  upload karein (`Content-Type: image/jpeg|image/png|image/webp`, max 3MB).
+  Response: `{"url": "https://.../avatars/<id>.jpg"}` — yehi URL phir
+  `updateProfile` mein bhejein. Server sirf yeh URL DB mein save karta hai,
+  kabhi bhi raw image bytes/base64 nahi.
+- Files disk par `AVATAR_DIR` (default `avatars`) mein save hoti hain —
+  Railway par isay DB wale volume ke andar rakhein (jaise `AVATAR_DIR=/data/avatars`)
+  warna restart par photos gum ho jayengi. `PUBLIC_BASE_URL` env var optional
+  hai (na dein to request ke Host header se khud URL ban jata hai).
+
+## 1 ID = 1 device (single session)
+Jis waqt koi account doosri jagah se signup/login karta hai, purana
+connection turant `forceLogout` message ke sath band kar diya jata hai —
+ek waqt mein ek ID sirf ek hi phone/device par active reh sakti hai.
+
+## Turn timer (inactive player handling)
+Har turn (roll ya pending-move) shuru hote hi room ko `turnTimer` (12
+second) bhej diya jata hai — client isi se us player ki profile par
+countdown ring dikha sakta hai. Agar 12 second tak player ne roll/move
+nahi kiya, server khud uski taraf se action le leta hai (auto-roll, ya
+pehla legal move) taake game kabhi na atke.
+
+## Game chhodne (leave) ya haarne par coins
+- **Haarna:** bet match hote hi kat jati hai; jeetne wale ko poora pot
+  `gameOver` par mil jata hai — haarne wale ke paise wapis nahi aate
+  (yeh pehle se hi tha).
+- **Beech mein chhod dena (leave/disconnect):** us player ko turant
+  "hataa hua" treat kiya jata hai. Agar sirf ek opponent bacha (2-player
+  game) to usay turant poora pot mil jata hai aur game khatam ho jati hai.
+  4-player game mein sirf chhodne wale ki bet baaki bache players mein
+  barabar baant di jati hai aur game jaari rehti hai (uske baad ke turns
+  turn-timer khud auto-play karta rehta hai).
+
 ## Abhi scope se bahar
-- Disconnect hone par sirf `opponentLeft` batataya jata hai — bet wapis
-  nahi hoti, auto-forfeit/reconnect-grace-period abhi nahi hai
-- 4-player games mein sirf 1st-place winner ko pura pot milta hai
+- 4-player games mein sirf 1st-place winner ko pura pot milta hai (leave
+  ke alawa)
 - Diamonds abhi sirf balance ke taur par store hote hain, koi gameplay use nahi

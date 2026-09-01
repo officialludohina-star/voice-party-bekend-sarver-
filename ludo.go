@@ -178,6 +178,50 @@ func (g *GameState) CurrentColor() Color {
 	return g.Players[g.CurrentIdx]
 }
 
+// IsOver — thread-safe check ke game khatam ho chuka hai ya nahi (turn-timer
+// aur leave-forfeiture logic isay use karte hain).
+func (g *GameState) IsOver() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.GameOver
+}
+
+// PendingAction — abhi konse player se konsa action expect ho raha hai
+// (dice roll ya pending move ka intekhaab) batata hai. nil matlab game
+// khatam ho chuka. Turn-timer isay use kar ke 12-second countdown arm karta
+// hai aur timeout par khud hi wahi action (auto-play) le leta hai.
+type PendingAction struct {
+	Color   Color
+	Kind    string // "roll" | "move"
+	Movable []int
+}
+
+func (g *GameState) PendingAction() *PendingAction {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.GameOver {
+		return nil
+	}
+	color := g.Players[g.CurrentIdx]
+	if len(g.Movable) > 0 {
+		return &PendingAction{Color: color, Kind: "move", Movable: append([]int{}, g.Movable...)}
+	}
+	return &PendingAction{Color: color, Kind: "roll"}
+}
+
+// ForceEnd — ek player ke game beech mein chhod jaane par (aur sirf ek hi
+// player bacha ho) baaki bache hue player ko seedha winner declare kar deta
+// hai, taake game turant khatam ho jaye aur pot settle ho sake.
+func (g *GameState) ForceEnd(winner Color) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.GameOver {
+		return
+	}
+	g.GameOver = true
+	g.Winner = winner
+}
+
 // weightedDiceRoll: asal HTML/Kotlin jaisa hi — 6 thora zyada, 1 thora kam.
 func weightedDiceRoll() int {
 	weights := [6]int{10, 16, 17, 17, 16, 24}

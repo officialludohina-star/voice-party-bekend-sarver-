@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -22,6 +24,7 @@ type ClientMsg struct {
 	Password string `json:"password"`
 	PlayerID string `json:"player_id"`
 	Name     string `json:"name"`
+	Avatar   string `json:"avatar"`
 	Bet      int    `json:"bet"`
 	Mode     string `json:"mode"`
 	Players  int    `json:"players"` // 2 ya 4
@@ -30,28 +33,40 @@ type ClientMsg struct {
 	Value    int    `json:"value"`
 }
 
+// ProfileInfo — display name + hosted avatar URL (kabhi bhi base64/data-URI
+// nahi hota, hamesha ek https link jo /avatar upload endpoint se milta hai).
+type ProfileInfo struct {
+	Name   string `json:"name"`
+	Avatar string `json:"avatar,omitempty"`
+}
+
 // ServerMsg — server se client ko jane wale saare messages.
 type ServerMsg struct {
-	Type     string    `json:"type"`
-	PlayerID string    `json:"player_id,omitempty"`
-	AuthToken string   `json:"auth_token,omitempty"`
-	RoomID   string    `json:"room_id,omitempty"`
-	Color    Color     `json:"color,omitempty"`
-	Players  []Color   `json:"players,omitempty"`
-	Mode     Mode      `json:"mode,omitempty"`
-	Bet      int       `json:"bet,omitempty"`
-	Coins    int64     `json:"coins,omitempty"`
-	Diamonds int64     `json:"diamonds,omitempty"`
-	State    *Snapshot `json:"state,omitempty"`
-	Events   []Event   `json:"events,omitempty"`
-	Message  string    `json:"message,omitempty"`
+	Type      string                 `json:"type"`
+	PlayerID  string                 `json:"player_id,omitempty"`
+	AuthToken string                 `json:"auth_token,omitempty"`
+	RoomID    string                 `json:"room_id,omitempty"`
+	Color     Color                  `json:"color,omitempty"`
+	Players   []Color                `json:"players,omitempty"`
+	Mode      Mode                   `json:"mode,omitempty"`
+	Bet       int                    `json:"bet,omitempty"`
+	Coins     int64                  `json:"coins,omitempty"`
+	Diamonds  int64                  `json:"diamonds,omitempty"`
+	State     *Snapshot              `json:"state,omitempty"`
+	Events    []Event                `json:"events,omitempty"`
+	Message   string                 `json:"message,omitempty"`
+	Name      string                 `json:"name,omitempty"`
+	Avatar    string                 `json:"avatar,omitempty"`
+	Profiles  map[Color]ProfileInfo  `json:"profiles,omitempty"`
+	Seconds   int                    `json:"seconds,omitempty"`
 }
 
 type Client struct {
-	id   string
-	name string
-	conn *websocket.Conn
-	send chan []byte
+	id     string
+	name   string // profile display name (email nahi — opponent ko yehi dikhta hai)
+	avatar string // hosted avatar URL (kabhi base64 nahi)
+	conn   *websocket.Conn
+	send   chan []byte
 
 	mu        sync.Mutex
 	authed    bool
@@ -108,6 +123,8 @@ func (c *Client) sendJSON(v interface{}) {
 	}
 }
 
+const TurnTimeoutSeconds = 12
+
 type Room struct {
 	id      string
 	mode    Mode
@@ -115,6 +132,13 @@ type Room struct {
 	game    *GameState
 	clients map[Color]*Client
 	mu      sync.Mutex
+
+	// Turn timer — har turn shuru hote hi 12s ka countdown arm hota hai; agar
+	// player us waqt tak roll/move na kare to server khud us ki taraf se
+	// action le leta hai (auto-play), taake game kabhi hamesha ke liye na atke.
+	timerMu  sync.Mutex
+	timer    *time.Timer
+	timerSeq int
 }
 
 func (r *Room) broadcast(msg ServerMsg) {
@@ -149,14 +173,55 @@ type Hub struct {
 	rooms   map[string]*Room
 	roomSeq int
 	store   *Store
+
+	// activeByID — "1 ID sirf 1 device" ka enforcement: har account ke liye
+	// sirf ek hi live connection allowed hai. Naya login/signup aane par purana
+	// connection turant force-logout ho jata hai.
+	activeByID map[string]*Client
 }
 
 func NewHub(store *Store) *Hub {
 	return &Hub{
-		waiting: map[waitKey][]*Client{},
-		rooms:   map[string]*Room{},
-		store:   store,
+		waiting:    map[waitKey][]*Client{},
+		rooms:      map[string]*Room{},
+		store:      store,
+		activeByID: map[string]*Client{},
 	}
+}
+
+// setActive — is account ID ko is client se "current device" mark karta hai.
+// Agar koi purana connection isi ID par pehle se active tha, wo wapis kar deta
+// hai taake use force-logout kiya ja sake.
+func (h *Hub) setActive(id string, c *Client) *Client {
+	h.mu.Lock()
+	old := h.activeByID[id]
+	h.activeByID[id] = c
+	h.mu.Unlock()
+	if old != nil && old != c {
+		return old
+	}
+	return nil
+}
+
+func (h *Hub) clearActive(id string, c *Client) {
+	h.mu.Lock()
+	if h.activeByID[id] == c {
+		delete(h.activeByID, id)
+	}
+	h.mu.Unlock()
+}
+
+// kickOld — purane device wale connection ko batata hai ke kisi aur jagah se
+// login ho gaya hai, phir uska socket band kar deta hai (agar wo kisi game/queue
+// mein ho to wahan se bhi nikal deta hai).
+func (h *Hub) kickOld(old *Client) {
+	old.sendJSON(ServerMsg{Type: "forceLogout", Message: "aapki ID kisi doosre phone/device par login ho gayi hai — is device se logout kiya ja raha hai"})
+	// Sirf connection band karte hain — ReadPump ka apna defer (LeaveQueue/
+	// LeaveRoom/clearActive) khud chal jayega jaise normal disconnect par hota
+	// hai. Yahan khud LeaveRoom call karna double-forfeiture jaisa bug bana
+	// sakta tha (coins do dafa credit hone ka khatra).
+	old.closeSend()
+	old.conn.Close()
 }
 
 // Join — client ko matchmaking queue mein daalta hai. Same mode+bet+player-count
@@ -228,6 +293,16 @@ func (h *Hub) Join(c *Client, mode string, bet int, playerCount int, magic bool)
 	h.rooms[roomID] = room
 	h.mu.Unlock()
 
+	// Sab members ke naam/dp ek dafa jama kar lo — sab players ko "matched"
+	// message ke sath dusron ki profile bhi mil jaye (opponent ka naam+dp
+	// dikhane ke liye).
+	profiles := map[Color]ProfileInfo{}
+	for _, member := range group {
+		member.mu.Lock()
+		profiles[member.color] = ProfileInfo{Name: member.name, Avatar: member.avatar}
+		member.mu.Unlock()
+	}
+
 	// Sabki bet ek sath escrow mein kaat lo — har player ko apna naya (post-deduction) balance milta hai.
 	for _, member := range group {
 		newBal, dErr := h.store.AdjustCoins(member.id, -int64(bet))
@@ -237,16 +312,20 @@ func (h *Hub) Join(c *Client, mode string, bet int, playerCount int, magic bool)
 			continue
 		}
 		member.sendJSON(ServerMsg{
-			Type:    "matched",
-			RoomID:  roomID,
-			Color:   member.color,
-			Players: colors,
-			Mode:    m,
-			Bet:     bet,
-			Coins:   newBal,
-			State:   game.Snapshot(),
+			Type:     "matched",
+			RoomID:   roomID,
+			Color:    member.color,
+			Players:  colors,
+			Mode:     m,
+			Bet:      bet,
+			Coins:    newBal,
+			State:    game.Snapshot(),
+			Profiles: profiles,
 		})
 	}
+
+	// Pehle turn ke liye 12-second countdown shuru kar dete hain.
+	h.armTurnTimer(room)
 }
 
 // LeaveQueue — agar client disconnect ho jaye jabke abhi match nahi mila.
@@ -263,27 +342,130 @@ func (h *Hub) LeaveQueue(c *Client) {
 	}
 }
 
-// LeaveRoom — game ke doraan koi disconnect ho jaye to baaki players ko batao.
+// LeaveRoom — game ke doraan koi disconnect/leave ho jaye to baaki players ko
+// batata hai, aur usay "hataa hua" treat karta hai: agar bet wali game thi to
+// uske coins turant baaki bache hue player(s) ki taraf chale jate hain (2-player
+// game mein poora pot mil jata hai aur game khatam ho jati hai; 4-player mein
+// sirf iski bet ka hissa baante hue baaki players ko mil jata hai aur game
+// jaari rehti hai — us player ki taraf ke turns turn-timer khud auto-play
+// karta rehta hai).
 func (h *Hub) LeaveRoom(c *Client) {
 	c.mu.Lock()
 	room := c.room
 	color := c.color
+	c.room = nil
 	c.mu.Unlock()
 	if room == nil {
 		return
 	}
+
 	room.mu.Lock()
+	_, wasIn := room.clients[color]
 	delete(room.clients, color)
-	empty := len(room.clients) == 0
+	remaining := make([]*Client, 0, len(room.clients))
+	for _, rc := range room.clients {
+		remaining = append(remaining, rc)
+	}
 	room.mu.Unlock()
+
+	if !wasIn {
+		return // already leave ho chuka tha (duplicate call) — kuch dobara mat karo
+	}
 
 	room.broadcastExcept(color, ServerMsg{Type: "opponentLeft", Color: color})
 
-	if empty {
+	if room.bet > 0 && !room.game.IsOver() {
+		if len(remaining) == 1 {
+			// Sirf ek player bacha — usay turant winner declare kar ke poora pot de do.
+			winner := remaining[0]
+			pot := int64(room.bet) * int64(len(room.game.Players))
+			room.game.ForceEnd(winner.color)
+			newBal, err := h.store.AdjustCoins(winner.id, pot)
+			if err == nil {
+				winner.sendJSON(ServerMsg{Type: "wallet", Color: winner.color, Coins: newBal, Message: "opponent left — aap jeet gaye, pot credit ho gaya"})
+			}
+			room.timerMu.Lock()
+			if room.timer != nil {
+				room.timer.Stop()
+				room.timer = nil
+			}
+			room.timerMu.Unlock()
+		} else if len(remaining) > 1 {
+			// 4-player game mein — jaane wale ki bet baaki bache hue players mein
+			// barabar baant do, game jaari rehti hai.
+			share := int64(room.bet) / int64(len(remaining))
+			if share > 0 {
+				for _, rc := range remaining {
+					newBal, err := h.store.AdjustCoins(rc.id, share)
+					if err == nil {
+						rc.sendJSON(ServerMsg{Type: "wallet", Color: rc.color, Coins: newBal, Message: fmt.Sprintf("%s left — unki bet ka hissa mil gaya", color)})
+					}
+				}
+			}
+		}
+	}
+
+	if len(remaining) == 0 {
 		h.mu.Lock()
 		delete(h.rooms, room.id)
 		h.mu.Unlock()
+		room.timerMu.Lock()
+		if room.timer != nil {
+			room.timer.Stop()
+			room.timer = nil
+		}
+		room.timerMu.Unlock()
 	}
+}
+
+// armTurnTimer — jis player ki taraf se action (roll ya move) expect ho raha
+// hai uske liye 12-second countdown (re)start karta hai aur room ko "turnTimer"
+// bhejta hai (isi se client us player ki profile par ring/countdown dikhata
+// hai). Timeout par khud hi us player ki taraf se action le leta hai
+// (auto-play) taake koi bhi inactive player game ko atka na sake.
+func (h *Hub) armTurnTimer(room *Room) {
+	pending := room.game.PendingAction()
+
+	room.timerMu.Lock()
+	if room.timer != nil {
+		room.timer.Stop()
+		room.timer = nil
+	}
+	if pending == nil {
+		room.timerMu.Unlock()
+		return
+	}
+	room.timerSeq++
+	seq := room.timerSeq
+	room.timer = time.AfterFunc(TurnTimeoutSeconds*time.Second, func() {
+		h.onTurnTimeout(room, seq, pending)
+	})
+	room.timerMu.Unlock()
+
+	room.broadcast(ServerMsg{Type: "turnTimer", Color: pending.Color, Seconds: TurnTimeoutSeconds})
+}
+
+func (h *Hub) onTurnTimeout(room *Room, seq int, pending *PendingAction) {
+	room.timerMu.Lock()
+	if seq != room.timerSeq {
+		room.timerMu.Unlock()
+		return // is dauran player ne khud action le liya ya kuch aur ho gaya — yeh timer purana hai
+	}
+	room.timerMu.Unlock()
+
+	var events []Event
+	var err error
+	if pending.Kind == "move" {
+		events, err = room.game.MoveToken(pending.Color, pending.Movable[0], 0)
+	} else {
+		events, err = room.game.RollDice(pending.Color)
+	}
+	if err != nil {
+		return
+	}
+	room.broadcast(ServerMsg{Type: "events", Events: events, State: room.game.Snapshot(), Message: "player inactive tha — server ne uski taraf se auto-play kiya"})
+	h.settleGameOver(room, events)
+	h.armTurnTimer(room)
 }
 
 // settleGameOver — agar events mein "gameOver" ho to poora pot (sab players ki
@@ -327,6 +509,7 @@ func (h *Hub) handleRoll(c *Client) {
 	}
 	room.broadcast(ServerMsg{Type: "events", Events: events, State: room.game.Snapshot()})
 	h.settleGameOver(room, events)
+	h.armTurnTimer(room)
 }
 
 func (h *Hub) handleMove(c *Client, tokenIdx int, value int) {
@@ -345,6 +528,7 @@ func (h *Hub) handleMove(c *Client, tokenIdx int, value int) {
 	}
 	room.broadcast(ServerMsg{Type: "events", Events: events, State: room.game.Snapshot()})
 	h.settleGameOver(room, events)
+	h.armTurnTimer(room)
 }
 
 // handleBuyExtraRoll — client "buyExtraRoll" bhejta hai (koi extra field nahi
@@ -384,6 +568,7 @@ func (h *Hub) handleBuyExtraRoll(c *Client) {
 	c.sendJSON(ServerMsg{Type: "wallet", Diamonds: newDiamonds, Message: "extra roll khareeda"})
 	room.broadcast(ServerMsg{Type: "events", Events: events, State: room.game.Snapshot()})
 	h.settleGameOver(room, events)
+	h.armTurnTimer(room)
 }
 
 // handleSignup / handleLogin — asal HTTP endpoints ki jagah ab yeh seedha
@@ -406,10 +591,14 @@ func (h *Hub) handleSignup(c *Client, email, password string) {
 	}
 	c.mu.Lock()
 	c.id = acc.ID
-	c.name = acc.Email
+	c.name = acc.Name
+	c.avatar = acc.Avatar
 	c.authed = true
 	c.mu.Unlock()
-	c.sendJSON(ServerMsg{Type: "auth", PlayerID: acc.ID, AuthToken: token, Coins: acc.Coins, Diamonds: acc.Diamonds})
+	if old := h.setActive(acc.ID, c); old != nil {
+		h.kickOld(old)
+	}
+	c.sendJSON(ServerMsg{Type: "auth", PlayerID: acc.ID, AuthToken: token, Coins: acc.Coins, Diamonds: acc.Diamonds, Name: acc.Name, Avatar: acc.Avatar})
 }
 
 func (h *Hub) handleLogin(c *Client, email, password string) {
@@ -420,15 +609,67 @@ func (h *Hub) handleLogin(c *Client, email, password string) {
 	}
 	c.mu.Lock()
 	c.id = acc.ID
-	c.name = acc.Email
+	c.name = acc.Name
+	c.avatar = acc.Avatar
 	c.authed = true
 	c.mu.Unlock()
-	c.sendJSON(ServerMsg{Type: "auth", PlayerID: acc.ID, AuthToken: token, Coins: acc.Coins, Diamonds: acc.Diamonds})
+	// Isi ID se pehle koi aur device connected ho to usay turant nikaal do —
+	// "1 ID sirf 1 device par" ka rule yahin lagu hota hai.
+	if old := h.setActive(acc.ID, c); old != nil {
+		h.kickOld(old)
+	}
+	c.sendJSON(ServerMsg{Type: "auth", PlayerID: acc.ID, AuthToken: token, Coins: acc.Coins, Diamonds: acc.Diamonds, Name: acc.Name, Avatar: acc.Avatar})
+}
+
+// handleUpdateProfile — client "updateProfile" bhejta hai jab user apna naam
+// ya avatar badalta hai. Avatar hamesha ek hosted https URL hona chahiye
+// (jaise /avatar upload endpoint deta hai) — base64/data-URI yahan reject ho
+// jata hai, taake DB mein kabhi bhi image ka raw base64 save na ho.
+func (h *Hub) handleUpdateProfile(c *Client, name, avatar string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		c.sendJSON(ServerMsg{Type: "error", Message: "naam khali nahi ho sakta"})
+		return
+	}
+	if len(name) > 16 {
+		name = name[:16]
+	}
+	if avatar != "" {
+		if strings.HasPrefix(avatar, "data:") || len(avatar) > 500 {
+			c.sendJSON(ServerMsg{Type: "error", Message: "avatar sirf ek image URL ho sakta hai (base64 allowed nahi) — pehle POST /avatar par photo upload karein, phir wapis mila hua URL yahan bhejein"})
+			return
+		}
+		if !strings.HasPrefix(avatar, "http://") && !strings.HasPrefix(avatar, "https://") {
+			c.sendJSON(ServerMsg{Type: "error", Message: "avatar ek valid http(s) URL hona chahiye"})
+			return
+		}
+	}
+	if err := h.store.UpdateProfile(c.id, name, avatar); err != nil {
+		c.sendJSON(ServerMsg{Type: "error", Message: "profile save nahi ho saka"})
+		return
+	}
+	c.mu.Lock()
+	c.name = name
+	c.avatar = avatar
+	room := c.room
+	color := c.color
+	c.mu.Unlock()
+	c.sendJSON(ServerMsg{Type: "profile", Name: name, Avatar: avatar})
+	if room != nil {
+		// Agar abhi kisi game mein hain to opponent ko turant naya naam/dp bata dein.
+		room.broadcastExcept(color, ServerMsg{Type: "opponentProfile", Color: color, Name: name, Avatar: avatar})
+	}
 }
 
 // ReadPump — client se aane wale messages parse karta hai aur route karta hai.
 func (h *Hub) ReadPump(c *Client) {
 	defer func() {
+		c.mu.Lock()
+		id := c.id
+		c.mu.Unlock()
+		if id != "" {
+			h.clearActive(id, c)
+		}
 		h.LeaveQueue(c)
 		h.LeaveRoom(c)
 		c.closeSend()
@@ -473,6 +714,8 @@ func (h *Hub) ReadPump(c *Client) {
 			h.handleMove(c, msg.Token, msg.Value)
 		case "buyExtraRoll":
 			h.handleBuyExtraRoll(c)
+		case "updateProfile":
+			h.handleUpdateProfile(c, msg.Name, msg.Avatar)
 		case "leave":
 			h.LeaveQueue(c)
 			h.LeaveRoom(c)

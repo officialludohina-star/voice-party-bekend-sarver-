@@ -24,6 +24,8 @@ const SignupBonusDiamonds = 30
 type Account struct {
 	ID        string
 	Email     string
+	Name      string
+	Avatar    string
 	Coins     int64
 	Diamonds  int64
 	CreatedAt time.Time
@@ -43,6 +45,8 @@ func OpenStore(path string) (*Store, error) {
 		id TEXT PRIMARY KEY,
 		email TEXT UNIQUE NOT NULL,
 		password_hash TEXT NOT NULL,
+		name TEXT NOT NULL DEFAULT '',
+		avatar TEXT NOT NULL DEFAULT '',
 		coins INTEGER NOT NULL DEFAULT 0,
 		diamonds INTEGER NOT NULL DEFAULT 0,
 		token TEXT,
@@ -53,7 +57,28 @@ func OpenStore(path string) (*Store, error) {
 	if _, err := db.Exec(schema); err != nil {
 		return nil, err
 	}
+	// Purane (pehle se deployed) DB mein name/avatar column na ho to add kar do.
+	// "duplicate column" error ignore karte hain — matlab column pehle se hai.
+	db.Exec(`ALTER TABLE accounts ADD COLUMN name TEXT NOT NULL DEFAULT ''`)
+	db.Exec(`ALTER TABLE accounts ADD COLUMN avatar TEXT NOT NULL DEFAULT ''`)
 	return &Store{db: db}, nil
+}
+
+// defaultName — signup ke waqt agar profile name kabhi na set kiya jaye to yeh
+// fallback dikhta hai (email ka hissa @ se pehle, max 16 chars).
+func defaultName(email string) string {
+	n := email
+	if i := strings.Index(email, "@"); i > 0 {
+		n = email[:i]
+	}
+	n = strings.TrimSpace(n)
+	if n == "" {
+		n = "Guest"
+	}
+	if len(n) > 16 {
+		n = n[:16]
+	}
+	return n
 }
 
 func randomHex(n int) (string, error) {
@@ -84,23 +109,24 @@ func (s *Store) SignUp(email, password string) (Account, string, error) {
 		return Account{}, "", err
 	}
 	now := time.Now().UTC()
+	name := defaultName(email)
 	_, err = s.db.Exec(
-		`INSERT INTO accounts (id, email, password_hash, coins, diamonds, token, created_at) VALUES (?,?,?,?,?,?,?)`,
-		id, email, string(hash), SignupBonusCoins, SignupBonusDiamonds, token, now.Format(time.RFC3339),
+		`INSERT INTO accounts (id, email, password_hash, name, avatar, coins, diamonds, token, created_at) VALUES (?,?,?,?,?,?,?,?,?)`,
+		id, email, string(hash), name, "", SignupBonusCoins, SignupBonusDiamonds, token, now.Format(time.RFC3339),
 	)
 	if err != nil {
 		return Account{}, "", errors.New("yeh email pehle se registered hai")
 	}
-	return Account{ID: id, Email: email, Coins: SignupBonusCoins, Diamonds: SignupBonusDiamonds, CreatedAt: now}, token, nil
+	return Account{ID: id, Email: email, Name: name, Coins: SignupBonusCoins, Diamonds: SignupBonusDiamonds, CreatedAt: now}, token, nil
 }
 
 // Login — email/password verify karta hai aur naya session token deta hai.
 func (s *Store) Login(email, password string) (Account, string, error) {
 	email = normalizeEmail(email)
-	var id, hash, createdAt string
+	var id, hash, createdAt, name, avatar string
 	var coins, diamonds int64
-	row := s.db.QueryRow(`SELECT id, password_hash, coins, diamonds, created_at FROM accounts WHERE email = ?`, email)
-	if err := row.Scan(&id, &hash, &coins, &diamonds, &createdAt); err != nil {
+	row := s.db.QueryRow(`SELECT id, password_hash, coins, diamonds, created_at, name, avatar FROM accounts WHERE email = ?`, email)
+	if err := row.Scan(&id, &hash, &coins, &diamonds, &createdAt, &name, &avatar); err != nil {
 		return Account{}, "", errors.New("email ya password ghalat hai")
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)); err != nil {
@@ -113,23 +139,35 @@ func (s *Store) Login(email, password string) (Account, string, error) {
 	if _, err := s.db.Exec(`UPDATE accounts SET token = ? WHERE id = ?`, token, id); err != nil {
 		return Account{}, "", err
 	}
+	if name == "" {
+		name = defaultName(email)
+	}
 	t, _ := time.Parse(time.RFC3339, createdAt)
-	return Account{ID: id, Email: email, Coins: coins, Diamonds: diamonds, CreatedAt: t}, token, nil
+	return Account{ID: id, Email: email, Name: name, Avatar: avatar, Coins: coins, Diamonds: diamonds, CreatedAt: t}, token, nil
 }
 
-// GetByToken — WebSocket connect hote hi token se account resolve karta hai.
+// GetByToken — WebSocket connect hote hi token se account resolve karta hai
+// (avatar-upload HTTP endpoint bhi isi se token verify karta hai).
 func (s *Store) GetByToken(token string) (Account, error) {
 	if token == "" {
 		return Account{}, errors.New("token missing")
 	}
-	var id, email, createdAt string
+	var id, email, createdAt, name, avatar string
 	var coins, diamonds int64
-	row := s.db.QueryRow(`SELECT id, email, coins, diamonds, created_at FROM accounts WHERE token = ?`, token)
-	if err := row.Scan(&id, &email, &coins, &diamonds, &createdAt); err != nil {
+	row := s.db.QueryRow(`SELECT id, email, coins, diamonds, created_at, name, avatar FROM accounts WHERE token = ?`, token)
+	if err := row.Scan(&id, &email, &coins, &diamonds, &createdAt, &name, &avatar); err != nil {
 		return Account{}, errors.New("invalid ya expired token — dobara login karein")
 	}
 	t, _ := time.Parse(time.RFC3339, createdAt)
-	return Account{ID: id, Email: email, Coins: coins, Diamonds: diamonds, CreatedAt: t}, nil
+	return Account{ID: id, Email: email, Name: name, Avatar: avatar, Coins: coins, Diamonds: diamonds, CreatedAt: t}, nil
+}
+
+// UpdateProfile — display name aur avatar URL save karta hai. Avatar hamesha
+// ek hosted image URL hota hai (jaise /avatar upload endpoint se milta hai) —
+// base64/data-URI yahan tak pohanchne hi nahi diya jata (hub.go mein check hai).
+func (s *Store) UpdateProfile(id, name, avatar string) error {
+	_, err := s.db.Exec(`UPDATE accounts SET name = ?, avatar = ? WHERE id = ?`, name, avatar, id)
+	return err
 }
 
 func (s *Store) GetCoins(id string) (int64, error) {
