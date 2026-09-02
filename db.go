@@ -120,6 +120,17 @@ func (s *Store) SignUp(email, password string) (Account, string, error) {
 	return Account{ID: id, Email: email, Name: name, Coins: SignupBonusCoins, Diamonds: SignupBonusDiamonds, CreatedAt: now}, token, nil
 }
 
+// GetIDByEmail — sirf yeh check karne ke liye ke email registered hai ya nahi
+// (forgot-password OTP bhejne se pehle) — password ya baaki data nahi chahiye.
+func (s *Store) GetIDByEmail(email string) (string, error) {
+	var id string
+	err := s.db.QueryRow(`SELECT id FROM accounts WHERE email = ?`, normalizeEmail(email)).Scan(&id)
+	if err != nil {
+		return "", errors.New("is email se koi account registered nahi hai")
+	}
+	return id, nil
+}
+
 // Login — email/password verify karta hai aur naya session token deta hai.
 func (s *Store) Login(email, password string) (Account, string, error) {
 	email = normalizeEmail(email)

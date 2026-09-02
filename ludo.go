@@ -4,7 +4,15 @@ import (
 	"errors"
 	"math/rand"
 	"sync"
+	"time"
 )
+
+// RerollWindowSeconds — dice roll hote hi player ke paas itne seconds hote hain
+// ke wo (diamonds kharch kar ke) turant dobara roll karke pehla number discard
+// kar sake. Is window ke baad "buyExtraRoll" is turn ke is roll ke liye band ho
+// jata hai — agla roll (agla turn ya six-streak ka agla roll) apni nayi 3-second
+// window paata hai.
+const RerollWindowSeconds = 3
 
 // ==== Yeh file Ludo ka poora "authoritative" game engine hai — Kotlin client
 // (LudoGameState.kt) wale rules ka hoobahoo Go port, lekin sirf abstract state
@@ -128,6 +136,10 @@ type GameState struct {
 
 	MagicDiceCells   []int
 	MagicRocketCells []int
+
+	// LastRollAt — abhi tak ka sabse aakhri dice-value kab dikha (RollDice ya
+	// BuyExtraRoll se) — reroll ke 3-second window ka hisaab isi se lagta hai.
+	LastRollAt time.Time
 
 	// Har player ne is game mein extra-roll par ab tak kitne diamonds kharch
 	// kiye aur kitni dafa khareeda — 1000 diamond cap yahan se track hoti hai.
@@ -263,6 +275,7 @@ func (g *GameState) RollDice(requester Color) ([]Event, error) {
 		g.bonusSix[color] = false
 	}
 	g.DiceByColor[color] = val
+	g.LastRollAt = time.Now()
 	events = append(events, Event{Type: "dice", Color: color, Value: val})
 
 	if val == 6 {
@@ -311,15 +324,28 @@ func (g *GameState) BuyExtraRoll(requester Color, cost int64) ([]Event, error) {
 	if requester != g.CurrentColor() {
 		return nil, errors.New("not your turn")
 	}
+	if time.Since(g.LastRollAt) > RerollWindowSeconds*time.Second {
+		return nil, errors.New("reroll ka 3-second window khatam ho chuka — is roll ke liye ab dobara nahi guma saktay")
+	}
 
 	color := requester
 	g.ExtraRollSpent[color] += cost
 	g.ExtraRollCount[color]++
 
+	// Pichla (abhi tak apply na hua) roll discard kar dein — yeh REPLACE hai,
+	// naya roll iske upar "extra" ban kar add nahi hota. Agar player ne is
+	// beech mein kahin move apply kar diya ho (SavedRolls pehle hi khaali ho
+	// chuka) to sirf naya roll add ho jata hai.
+	if len(g.SavedRolls) > 0 {
+		g.SavedRolls = g.SavedRolls[:len(g.SavedRolls)-1]
+	}
+	g.Movable = nil
+
 	var events []Event
 	val := weightedDiceRoll()
 	g.DiceByColor[color] = val
-	events = append(events, Event{Type: "dice", Color: color, Value: val, Message: "extraRoll"})
+	g.LastRollAt = time.Now()
+	events = append(events, Event{Type: "dice", Color: color, Value: val, Message: "reroll"})
 
 	if val == 6 {
 		g.sixStreak++

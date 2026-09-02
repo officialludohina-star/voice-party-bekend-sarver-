@@ -49,6 +49,17 @@ ya
 {"type": "login", "email": "user@gmail.com", "password": "..."}
 ```
 
+App agar pehle se kabhi login/signup ho chuki ho aur uska `auth_token` device par
+save ho (SharedPreferences waghera), to naya connection khulte hi seedha yeh bhi
+bhej sakti hai — email/password dobara maangne ki zaroorat nahi:
+```json
+{"type": "authToken", "auth_token": "<pehle mila hua token>"}
+```
+Response bilkul login jaisa hi (`{"type":"auth", ...}`) milta hai. Agar token
+ab valid nahi (jaise DB reset ho chuki ho — neeche "Zaroori" wala Volume point
+dekhein) to `{"type":"error", ...}` milta hai — is case mein app ko normal
+login/signup screen dikhani chahiye.
+
 Server jawab deta hai:
 ```json
 {"type": "auth", "player_id": "a1b2c3...", "auth_token": "xxxx...", "coins": 10000, "diamonds": 30}

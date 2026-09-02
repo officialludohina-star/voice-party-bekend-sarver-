@@ -34,6 +34,9 @@ type ClientMsg struct {
 	// AuthToken — sirf "resume" message ke liye (naam "token" se isliye alag rakha
 	// hai kyunke "token" field upar move ke tokenIndex ke liye pehle se use ho raha hai).
 	AuthToken string `json:"auth_token"`
+	// Otp — "resetPassword" ke sath server-verified 6-digit code (requestPasswordReset
+	// se milta hai). Bina is match ke password kabhi reset nahi hota.
+	Otp string `json:"otp"`
 }
 
 // ProfileInfo — display name + hosted avatar URL (kabhi bhi base64/data-URI
@@ -126,7 +129,7 @@ func (c *Client) sendJSON(v interface{}) {
 	}
 }
 
-const TurnTimeoutSeconds = 12
+const TurnTimeoutSeconds = 10
 
 // ==== Net/connection drop ke waqt reconnect grace ====
 // Agar bet wali game ke doraan kisi ka connection (net jaane se) achanak toot
@@ -141,7 +144,7 @@ const TurnTimeoutSeconds = 12
 // Frontend apni taraf se "Reconnecting… 30s" dikha sakta hai aur 30s guzarne
 // par "Exit / Connect" popup de sakta hai — "Connect" par bhi yehi resume flow
 // dobara try hota hai, jab tak neeche wala poora grace window khatam na ho.
-const ReconnectGraceSeconds = 60
+const ReconnectGraceSeconds = 30
 
 type graceEntry struct {
 	room  *Room
@@ -207,6 +210,10 @@ type Hub struct {
 	// hone se pehle ka window). Isi se "resume" message par pata chalta hai ke
 	// yeh player kis room/color mein wapis jayega.
 	grace map[string]*graceEntry
+
+	// otps — forgot-password OTP ab yahan (server par) generate + verify hoti
+	// hai, client par nahi (otp.go dekhein).
+	otps *OtpStore
 }
 
 func NewHub(store *Store) *Hub {
@@ -216,6 +223,7 @@ func NewHub(store *Store) *Hub {
 		store:      store,
 		activeByID: map[string]*Client{},
 		grace:      map[string]*graceEntry{},
+		otps:       NewOtpStore(),
 	}
 }
 
@@ -333,14 +341,42 @@ func (h *Hub) Join(c *Client, mode string, bet int, playerCount int, magic bool)
 		member.mu.Unlock()
 	}
 
-	// Sabki bet ek sath escrow mein kaat lo — har player ko apna naya (post-deduction) balance milta hai.
+	// Sabki bet ek sath escrow mein kaat lo. Agar kisi ek ki deduction fail ho
+	// jaye (jaise iske balance mein is dauran hi kami aa gayi ho), to poora match
+	// cancel kar dete hain aur jin ki bet kat chuki thi unhein turant refund kar
+	// dete hain — koi bhi player bina bet kate is room ke andar nahi reh sakta
+	// (pehle yahan bug tha: fail hone par sirf error bhej dete thay lekin member
+	// room.clients mein reh jata tha aur bina paise diye khel sakta tha).
+	deductedBal := map[Color]int64{}
+	anyFailed := false
 	for _, member := range group {
 		newBal, dErr := h.store.AdjustCoins(member.id, -int64(bet))
 		if dErr != nil {
+			anyFailed = true
 			newBal, _ = h.store.GetCoins(member.id)
 			member.sendJSON(ServerMsg{Type: "error", Message: "bet deduct nahi ho saki: " + dErr.Error(), Coins: newBal})
 			continue
 		}
+		deductedBal[member.color] = newBal
+	}
+
+	if anyFailed {
+		for _, member := range group {
+			if _, ok := deductedBal[member.color]; ok {
+				refunded, _ := h.store.AdjustCoins(member.id, int64(bet))
+				member.sendJSON(ServerMsg{Type: "error", Message: "match cancel ho gaya (ek player ka bet deduct nahi ho saka) — dobara try karein", Coins: refunded})
+			}
+			member.mu.Lock()
+			member.room = nil
+			member.mu.Unlock()
+		}
+		h.mu.Lock()
+		delete(h.rooms, roomID)
+		h.mu.Unlock()
+		return
+	}
+
+	for _, member := range group {
 		member.sendJSON(ServerMsg{
 			Type:     "matched",
 			RoomID:   roomID,
@@ -348,13 +384,13 @@ func (h *Hub) Join(c *Client, mode string, bet int, playerCount int, magic bool)
 			Players:  colors,
 			Mode:     m,
 			Bet:      bet,
-			Coins:    newBal,
+			Coins:    deductedBal[member.color],
 			State:    game.Snapshot(),
 			Profiles: profiles,
 		})
 	}
 
-	// Pehle turn ke liye 12-second countdown shuru kar dete hain.
+	// Pehle turn ke liye 10-second countdown shuru kar dete hain.
 	h.armTurnTimer(room)
 }
 
@@ -410,6 +446,21 @@ func (h *Hub) LeaveRoom(c *Client) {
 			winner := remaining[0]
 			pot := int64(room.bet) * int64(len(room.game.Players))
 			room.game.ForceEnd(winner.color)
+
+			// Asal "gameOver" event bhi bhejte hain (sirf ad-hoc "wallet" message nahi) —
+			// isi se client ka wahi win/lose result-screen trigger hota hai jo normal
+			// (board par jeetne wali) win par hota hai, taake "opponent left" sirf ek
+			// chhota toast na dikhe balke poora winner/loser screen aaye.
+			room.broadcast(ServerMsg{
+				Type: "events",
+				Events: []Event{{
+					Type:    "gameOver",
+					Winner:  winner.color,
+					Message: fmt.Sprintf("%s left — %s winner ban gaya", color, winner.color),
+				}},
+				State: room.game.Snapshot(),
+			})
+
 			newBal, err := h.store.AdjustCoins(winner.id, pot)
 			if err == nil {
 				winner.sendJSON(ServerMsg{Type: "wallet", Color: winner.color, Coins: newBal, Message: "opponent left — aap jeet gaye, pot credit ho gaya"})
@@ -704,7 +755,7 @@ func (h *Hub) handleBuyExtraRoll(c *Client) {
 
 	cost := room.game.NextExtraRollCost(color)
 	if cost == 0 {
-		c.sendJSON(ServerMsg{Type: "error", Message: "is game mein extra-roll ki 1000 diamond limit khatam ho chuki — lock ho gaya"})
+		c.sendJSON(ServerMsg{Type: "error", Message: "is game mein reroll ki 1000 diamond limit khatam ho chuki — lock ho gaya"})
 		return
 	}
 
@@ -778,21 +829,84 @@ func (h *Hub) handleLogin(c *Client, email, password string) {
 	c.sendJSON(ServerMsg{Type: "auth", PlayerID: acc.ID, AuthToken: token, Coins: acc.Coins, Diamonds: acc.Diamonds, Name: acc.Name, Avatar: acc.Avatar})
 }
 
+// handleAuthToken — client app dobara khulne par apna PEHLE se saved auth_token
+// bhejta hai (email/password dobara maange bina). Agar token abhi bhi DB mein
+// valid hai to bilkul login jaisa hi "auth" response mil jata hai aur user
+// khud-b-khud logged-in ho jata hai — isi se "1 dafa login karo, phir hamesha
+// logged-in raho" wala flow poora hota hai. Token invalid/expired ho (jaise
+// DB reset ho chuki ho) to seedha error milta hai aur client ko wapis normal
+// login/signup screen dikhani chahiye.
+func (h *Hub) handleAuthToken(c *Client, token string) {
+	acc, err := h.store.GetByToken(token)
+	if err != nil {
+		c.sendJSON(ServerMsg{Type: "error", Message: "session expire ho chuki hai — dobara login karein"})
+		return
+	}
+	c.mu.Lock()
+	c.id = acc.ID
+	c.name = acc.Name
+	c.avatar = acc.Avatar
+	c.authed = true
+	c.mu.Unlock()
+	// Isi ID se pehle koi aur device connected ho to usay turant nikaal do —
+	// "1 ID sirf 1 device" ka rule yahan bhi lagu hota hai.
+	if old := h.setActive(acc.ID, c); old != nil {
+		h.kickOld(old)
+	}
+	c.sendJSON(ServerMsg{Type: "auth", PlayerID: acc.ID, AuthToken: token, Coins: acc.Coins, Diamonds: acc.Diamonds, Name: acc.Name, Avatar: acc.Avatar})
+}
+
 // handleUpdateProfile — client "updateProfile" bhejta hai jab user apna naam
 // ya avatar badalta hai. Avatar hamesha ek hosted https URL hona chahiye
 // (jaise /avatar upload endpoint deta hai) — base64/data-URI yahan reject ho
 // jata hai, taake DB mein kabhi bhi image ka raw base64 save na ho.
-// handleResetPassword — "Forgot Password" flow. App pehle khud email par OTP
-// bhej kar user se verify karwa chuka hota hai (EmailJS se, client-side) —
-// yeh call sirf naya password set karta hai us email wale account par aur
-// turant login jaisa "auth" response deta hai (naya session token ke sath).
-func (h *Hub) handleResetPassword(c *Client, email, newPassword string) {
-	if email == "" || newPassword == "" {
-		c.sendJSON(ServerMsg{Type: "error", Message: "email aur naya password dono zaroori hain"})
+
+// handleRequestPasswordReset — "Forgot Password" ka pehla step. Server khud
+// 6-digit OTP banata hai, thodi der (5 min) memory mein rakhta hai, aur EmailJS
+// ke zariye khud us email par bhej deta hai. Client ko sirf generic "bhej diya"
+// jawab milta hai (yeh nahi bataya jata ke account hai ya nahi — ta ke koi email
+// enumerate na kar sake).
+func (h *Hub) handleRequestPasswordReset(c *Client, email string) {
+	email = normalizeEmail(email)
+	if email == "" {
+		c.sendJSON(ServerMsg{Type: "error", Message: "email zaroori hai"})
+		return
+	}
+	if _, err := h.store.GetIDByEmail(email); err != nil {
+		// Jaan-boojh kar wahi generic success jaisa jawab — email enumeration na ho.
+		c.sendJSON(ServerMsg{Type: "otpSent", Message: "agar yeh email registered hai to verification code bhej diya gaya hai"})
+		return
+	}
+	otp, err := h.otps.Issue(email)
+	if err != nil {
+		c.sendJSON(ServerMsg{Type: "error", Message: "code generate nahi ho saka, dobara try karein"})
+		return
+	}
+	go func() {
+		if sendErr := sendOtpEmail(email, otp); sendErr != nil {
+			log.Println("sendOtpEmail failed:", sendErr)
+		}
+	}()
+	c.sendJSON(ServerMsg{Type: "otpSent", Message: "agar yeh email registered hai to verification code bhej diya gaya hai"})
+}
+
+// handleResetPassword — "Forgot Password" ka final step. Ab OTP ka asal
+// match+expiry check bhi YAHIN (server par) hota hai — pehle yeh sirf client
+// (app) par hota tha, jis se koi bhi seedha WebSocket message bhej kar bina
+// OTP ke kisi ka bhi password badal sakta tha. Match hone par (single-use)
+// code turant discard ho jata hai.
+func (h *Hub) handleResetPassword(c *Client, email, newPassword, otp string) {
+	email = normalizeEmail(email)
+	if email == "" || newPassword == "" || otp == "" {
+		c.sendJSON(ServerMsg{Type: "error", Message: "email, naya password aur verification code teeno zaroori hain"})
 		return
 	}
 	if len(newPassword) < 6 {
 		c.sendJSON(ServerMsg{Type: "error", Message: "password kam se kam 6 characters ka ho"})
+		return
+	}
+	if !h.otps.Verify(email, otp) {
+		c.sendJSON(ServerMsg{Type: "error", Message: "verification code ghalat ya expire ho chuka hai — dobara code mangwayein"})
 		return
 	}
 	acc, token, err := h.store.ResetPassword(email, newPassword)
@@ -899,8 +1013,16 @@ func (h *Hub) ReadPump(c *Client) {
 			h.handleResume(c, msg.AuthToken)
 			continue
 		}
+		if msg.Type == "authToken" {
+			h.handleAuthToken(c, msg.AuthToken)
+			continue
+		}
+		if msg.Type == "requestPasswordReset" {
+			h.handleRequestPasswordReset(c, msg.Email)
+			continue
+		}
 		if msg.Type == "resetPassword" {
-			h.handleResetPassword(c, msg.Email, msg.Password)
+			h.handleResetPassword(c, msg.Email, msg.Password, msg.Otp)
 			continue
 		}
 
