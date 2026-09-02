@@ -782,6 +782,36 @@ func (h *Hub) handleLogin(c *Client, email, password string) {
 // ya avatar badalta hai. Avatar hamesha ek hosted https URL hona chahiye
 // (jaise /avatar upload endpoint deta hai) — base64/data-URI yahan reject ho
 // jata hai, taake DB mein kabhi bhi image ka raw base64 save na ho.
+// handleResetPassword — "Forgot Password" flow. App pehle khud email par OTP
+// bhej kar user se verify karwa chuka hota hai (EmailJS se, client-side) —
+// yeh call sirf naya password set karta hai us email wale account par aur
+// turant login jaisa "auth" response deta hai (naya session token ke sath).
+func (h *Hub) handleResetPassword(c *Client, email, newPassword string) {
+	if email == "" || newPassword == "" {
+		c.sendJSON(ServerMsg{Type: "error", Message: "email aur naya password dono zaroori hain"})
+		return
+	}
+	if len(newPassword) < 6 {
+		c.sendJSON(ServerMsg{Type: "error", Message: "password kam se kam 6 characters ka ho"})
+		return
+	}
+	acc, token, err := h.store.ResetPassword(email, newPassword)
+	if err != nil {
+		c.sendJSON(ServerMsg{Type: "error", Message: err.Error()})
+		return
+	}
+	c.mu.Lock()
+	c.id = acc.ID
+	c.name = acc.Name
+	c.avatar = acc.Avatar
+	c.authed = true
+	c.mu.Unlock()
+	if old := h.setActive(acc.ID, c); old != nil {
+		h.kickOld(old)
+	}
+	c.sendJSON(ServerMsg{Type: "auth", PlayerID: acc.ID, AuthToken: token, Coins: acc.Coins, Diamonds: acc.Diamonds, Name: acc.Name, Avatar: acc.Avatar})
+}
+
 func (h *Hub) handleUpdateProfile(c *Client, name, avatar string) {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -867,6 +897,10 @@ func (h *Hub) ReadPump(c *Client) {
 		}
 		if msg.Type == "resume" {
 			h.handleResume(c, msg.AuthToken)
+			continue
+		}
+		if msg.Type == "resetPassword" {
+			h.handleResetPassword(c, msg.Email, msg.Password)
 			continue
 		}
 

@@ -146,6 +146,42 @@ func (s *Store) Login(email, password string) (Account, string, error) {
 	return Account{ID: id, Email: email, Name: name, Avatar: avatar, Coins: coins, Diamonds: diamonds, CreatedAt: t}, token, nil
 }
 
+// ResetPassword — "Forgot Password" flow ke liye. Client (app) pehle khud
+// email par OTP bhej kar verify kar chuka hota hai (EmailJS se) — is server
+// call se pehle koi dobara OTP check nahi hota, bas naya password set ho
+// jata hai us email wale account par. Login jaisa hi naya session token
+// wapis milta hai taake user turant logged-in ho jaye.
+func (s *Store) ResetPassword(email, newPassword string) (Account, string, error) {
+	email = normalizeEmail(email)
+	hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+	if err != nil {
+		return Account{}, "", err
+	}
+	token, err := randomHex(24)
+	if err != nil {
+		return Account{}, "", err
+	}
+	res, err := s.db.Exec(`UPDATE accounts SET password_hash = ?, token = ? WHERE email = ?`, string(hash), token, email)
+	if err != nil {
+		return Account{}, "", err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return Account{}, "", errors.New("is email se koi account registered nahi hai")
+	}
+	var id, name, avatar, createdAt string
+	var coins, diamonds int64
+	row := s.db.QueryRow(`SELECT id, coins, diamonds, created_at, name, avatar FROM accounts WHERE email = ?`, email)
+	if err := row.Scan(&id, &coins, &diamonds, &createdAt, &name, &avatar); err != nil {
+		return Account{}, "", err
+	}
+	if name == "" {
+		name = defaultName(email)
+	}
+	t, _ := time.Parse(time.RFC3339, createdAt)
+	return Account{ID: id, Email: email, Name: name, Avatar: avatar, Coins: coins, Diamonds: diamonds, CreatedAt: t}, token, nil
+}
+
 // GetByToken — WebSocket connect hote hi token se account resolve karta hai
 // (avatar-upload HTTP endpoint bhi isi se token verify karta hai).
 func (s *Store) GetByToken(token string) (Account, error) {
