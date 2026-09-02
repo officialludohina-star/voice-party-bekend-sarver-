@@ -31,6 +31,9 @@ type ClientMsg struct {
 	Magic    bool   `json:"magic"`
 	Token    int    `json:"token"`
 	Value    int    `json:"value"`
+	// AuthToken — sirf "resume" message ke liye (naam "token" se isliye alag rakha
+	// hai kyunke "token" field upar move ke tokenIndex ke liye pehle se use ho raha hai).
+	AuthToken string `json:"auth_token"`
 }
 
 // ProfileInfo — display name + hosted avatar URL (kabhi bhi base64/data-URI
@@ -125,6 +128,27 @@ func (c *Client) sendJSON(v interface{}) {
 
 const TurnTimeoutSeconds = 12
 
+// ==== Net/connection drop ke waqt reconnect grace ====
+// Agar bet wali game ke doraan kisi ka connection (net jaane se) achanak toot
+// jaye, to usay foran haara hua treat nahi karte — bilkul turant forfeit karne
+// ki bajaye ReconnectGraceSeconds tak room reserved rakhte hain. Isi dauran
+// agar player wapis connect ho kar apna purana auth_token "resume" message mein
+// bhej de, to bilkul wahi room/color/game state wapis mil jati hai (poori
+// Snapshot ke sath) — jaise kuch hua hi na ho. Agar poore grace period tak
+// koi resume na aaye, tabhi jaake wahi purani forfeiture logic (LeaveRoom)
+// chalti hai — dusre player ka intezaar hamesha ke liye nahi hota.
+//
+// Frontend apni taraf se "Reconnecting… 30s" dikha sakta hai aur 30s guzarne
+// par "Exit / Connect" popup de sakta hai — "Connect" par bhi yehi resume flow
+// dobara try hota hai, jab tak neeche wala poora grace window khatam na ho.
+const ReconnectGraceSeconds = 60
+
+type graceEntry struct {
+	room  *Room
+	color Color
+	timer *time.Timer
+}
+
 type Room struct {
 	id      string
 	mode    Mode
@@ -178,6 +202,11 @@ type Hub struct {
 	// sirf ek hi live connection allowed hai. Naya login/signup aane par purana
 	// connection turant force-logout ho jata hai.
 	activeByID map[string]*Client
+
+	// grace — account ID -> uska pending reconnect (net drop ke baad, forfeit
+	// hone se pehle ka window). Isi se "resume" message par pata chalta hai ke
+	// yeh player kis room/color mein wapis jayega.
+	grace map[string]*graceEntry
 }
 
 func NewHub(store *Store) *Hub {
@@ -186,6 +215,7 @@ func NewHub(store *Store) *Hub {
 		rooms:      map[string]*Room{},
 		store:      store,
 		activeByID: map[string]*Client{},
+		grace:      map[string]*graceEntry{},
 	}
 }
 
@@ -416,6 +446,133 @@ func (h *Hub) LeaveRoom(c *Client) {
 		}
 		room.timerMu.Unlock()
 	}
+}
+
+// startDisconnectGrace — net/connection drop hone par foran forfeit karne ki
+// bajaye ReconnectGraceSeconds ka window deta hai. Room abhi tak isi client ki
+// (dead) entry pakde rehta hai — game ki turn-timer (12s auto-play) apna kaam
+// jaisa hi karti rehti hai, taake baaki players ko intezaar na karna pade.
+// Agar poora grace window guzar jaye to finalizeDisconnect asal forfeiture
+// (LeaveRoom) chala deta hai.
+func (h *Hub) startDisconnectGrace(id string, room *Room, color Color) {
+	h.mu.Lock()
+	h.grace[id] = &graceEntry{room: room, color: color}
+	h.mu.Unlock()
+
+	room.broadcastExcept(color, ServerMsg{
+		Type: "opponentDisconnected", Color: color, Seconds: ReconnectGraceSeconds,
+		Message: "opponent ka connection chala gaya — reconnect hone ka intezaar kar rahe hain",
+	})
+
+	timer := time.AfterFunc(ReconnectGraceSeconds*time.Second, func() {
+		h.finalizeDisconnect(id, room, color)
+	})
+
+	h.mu.Lock()
+	if entry, ok := h.grace[id]; ok && entry.room == room {
+		entry.timer = timer
+	}
+	h.mu.Unlock()
+}
+
+// finalizeDisconnect — grace window bina reconnect ke guzar gaya. Ab wahi
+// purani forfeiture/leave logic chalti hai (pot settle, baaki players ko batana).
+func (h *Hub) finalizeDisconnect(id string, room *Room, color Color) {
+	h.mu.Lock()
+	entry, ok := h.grace[id]
+	if !ok || entry.room != room {
+		h.mu.Unlock()
+		return // is dauran resume ho chuka ya room hi badal chuka — purana timer hai
+	}
+	delete(h.grace, id)
+	h.mu.Unlock()
+
+	room.mu.Lock()
+	deadClient, stillThere := room.clients[color]
+	room.mu.Unlock()
+	if !stillThere {
+		return
+	}
+	h.LeaveRoom(deadClient)
+}
+
+// handleResume — client "resume" message bhejta hai jab uska connection wapis
+// aaye (auto ya user ke "Connect" tap karne par), sirf apna purana auth_token
+// dobara bhej ke. Agar is token ke account ka koi pending disconnect-grace
+// active mila to bilkul wahi room/color/game wapis mil jati hai (poori
+// current Snapshot ke sath) — yeh signup/login jaisa hi pehla message hai,
+// isliye ReadPump mein auth-check se pehle hi handle hota hai.
+func (h *Hub) handleResume(c *Client, authToken string) {
+	acc, err := h.store.GetByToken(authToken)
+	if err != nil {
+		c.sendJSON(ServerMsg{Type: "error", Message: "session expire ho chuka — dobara login karein"})
+		return
+	}
+
+	h.mu.Lock()
+	entry, ok := h.grace[acc.ID]
+	if ok {
+		delete(h.grace, acc.ID)
+	}
+	h.mu.Unlock()
+	if !ok {
+		c.sendJSON(ServerMsg{Type: "error", Message: "resume karne ke liye koi active game nahi mili — dobara login karein"})
+		return
+	}
+	if entry.timer != nil {
+		entry.timer.Stop()
+	}
+
+	room := entry.room
+	color := entry.color
+
+	room.mu.Lock()
+	_, stillGoing := room.clients[color]
+	if stillGoing {
+		room.clients[color] = c
+	}
+	room.mu.Unlock()
+	if !stillGoing {
+		// dusri taraf se game khud hi khatam ho chuki (room saaf ho chuka)
+		c.sendJSON(ServerMsg{Type: "error", Message: "yeh game ab active nahi hai"})
+		return
+	}
+
+	c.mu.Lock()
+	c.id = acc.ID
+	c.name = acc.Name
+	c.avatar = acc.Avatar
+	c.authed = true
+	c.room = room
+	c.color = color
+	c.mu.Unlock()
+
+	if old := h.setActive(acc.ID, c); old != nil {
+		h.kickOld(old)
+	}
+
+	profiles := map[Color]ProfileInfo{}
+	room.mu.Lock()
+	for col, rc := range room.clients {
+		rc.mu.Lock()
+		profiles[col] = ProfileInfo{Name: rc.name, Avatar: rc.avatar}
+		rc.mu.Unlock()
+	}
+	room.mu.Unlock()
+
+	c.sendJSON(ServerMsg{
+		Type:     "resumed",
+		RoomID:   room.id,
+		Color:    color,
+		Players:  room.game.Players,
+		Mode:     room.mode,
+		Bet:      room.bet,
+		Coins:    acc.Coins,
+		Diamonds: acc.Diamonds,
+		State:    room.game.Snapshot(),
+		Profiles: profiles,
+	})
+	room.broadcastExcept(color, ServerMsg{Type: "opponentReconnected", Color: color})
 }
 
 // armTurnTimer — jis player ki taraf se action (roll ya move) expect ho raha
@@ -666,12 +823,24 @@ func (h *Hub) ReadPump(c *Client) {
 	defer func() {
 		c.mu.Lock()
 		id := c.id
+		room := c.room
+		color := c.color
 		c.mu.Unlock()
+
 		if id != "" {
 			h.clearActive(id, c)
 		}
 		h.LeaveQueue(c)
-		h.LeaveRoom(c)
+
+		// Agar yeh client kisi bet wali, chal rahi game ke beech mein tha (aur
+		// khud "leave" bhej kar jaan-boojh kar nahi gaya — us case mein c.room
+		// pehle hi nil ho chuka hoga), to turant forfeit karne ki bajaye pehle
+		// reconnect ka mauka dete hain.
+		if id != "" && room != nil && room.bet > 0 && !room.game.IsOver() {
+			h.startDisconnectGrace(id, room, color)
+		} else {
+			h.LeaveRoom(c)
+		}
 		c.closeSend()
 		c.conn.Close()
 	}()
@@ -694,6 +863,10 @@ func (h *Hub) ReadPump(c *Client) {
 		}
 		if msg.Type == "login" {
 			h.handleLogin(c, msg.Email, msg.Password)
+			continue
+		}
+		if msg.Type == "resume" {
+			h.handleResume(c, msg.AuthToken)
 			continue
 		}
 
