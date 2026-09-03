@@ -547,6 +547,31 @@ func (h *Hub) finalizeDisconnect(id string, room *Room, color Color) {
 	h.LeaveRoom(deadClient)
 }
 
+// handleTokenLogin — app dobara khulne par (koi active game na ho) client
+// apna saved auth_token bhej kar khud-b-khud login karna chahta hai. "resume"
+// se yeh isliye alag hai ke "resume" sirf tab kaam karta hai jab koi
+// disconnect-grace active ho (yani beech-e-game net gaya ho) — plain app-restart
+// (koi game chal hi nahi raha tha) mein "resume" "koi active game nahi mili"
+// keh kar reject kar deta, jis se app hamesha dobara login/signup screen par
+// hi ruk jati thi chahe session valid hi kyun na ho.
+func (h *Hub) handleTokenLogin(c *Client, authToken string) {
+	acc, err := h.store.GetByToken(authToken)
+	if err != nil {
+		c.sendJSON(ServerMsg{Type: "error", Message: "session expire ho chuka — dobara login karein"})
+		return
+	}
+	c.mu.Lock()
+	c.id = acc.ID
+	c.name = acc.Name
+	c.avatar = acc.Avatar
+	c.authed = true
+	c.mu.Unlock()
+	if old := h.setActive(acc.ID, c); old != nil {
+		h.kickOld(old)
+	}
+	c.sendJSON(ServerMsg{Type: "auth", PlayerID: acc.ID, AuthToken: authToken, Coins: acc.Coins, Diamonds: acc.Diamonds, Name: acc.Name, Avatar: acc.Avatar})
+}
+
 // handleResume — client "resume" message bhejta hai jab uska connection wapis
 // aaye (auto ya user ke "Connect" tap karne par), sirf apna purana auth_token
 // dobara bhej ke. Agar is token ke account ka koi pending disconnect-grace
@@ -829,33 +854,6 @@ func (h *Hub) handleLogin(c *Client, email, password string) {
 	c.sendJSON(ServerMsg{Type: "auth", PlayerID: acc.ID, AuthToken: token, Coins: acc.Coins, Diamonds: acc.Diamonds, Name: acc.Name, Avatar: acc.Avatar})
 }
 
-// handleAuthToken — client app dobara khulne par apna PEHLE se saved auth_token
-// bhejta hai (email/password dobara maange bina). Agar token abhi bhi DB mein
-// valid hai to bilkul login jaisa hi "auth" response mil jata hai aur user
-// khud-b-khud logged-in ho jata hai — isi se "1 dafa login karo, phir hamesha
-// logged-in raho" wala flow poora hota hai. Token invalid/expired ho (jaise
-// DB reset ho chuki ho) to seedha error milta hai aur client ko wapis normal
-// login/signup screen dikhani chahiye.
-func (h *Hub) handleAuthToken(c *Client, token string) {
-	acc, err := h.store.GetByToken(token)
-	if err != nil {
-		c.sendJSON(ServerMsg{Type: "error", Message: "session expire ho chuki hai — dobara login karein"})
-		return
-	}
-	c.mu.Lock()
-	c.id = acc.ID
-	c.name = acc.Name
-	c.avatar = acc.Avatar
-	c.authed = true
-	c.mu.Unlock()
-	// Isi ID se pehle koi aur device connected ho to usay turant nikaal do —
-	// "1 ID sirf 1 device" ka rule yahan bhi lagu hota hai.
-	if old := h.setActive(acc.ID, c); old != nil {
-		h.kickOld(old)
-	}
-	c.sendJSON(ServerMsg{Type: "auth", PlayerID: acc.ID, AuthToken: token, Coins: acc.Coins, Diamonds: acc.Diamonds, Name: acc.Name, Avatar: acc.Avatar})
-}
-
 // handleUpdateProfile — client "updateProfile" bhejta hai jab user apna naam
 // ya avatar badalta hai. Avatar hamesha ek hosted https URL hona chahiye
 // (jaise /avatar upload endpoint deta hai) — base64/data-URI yahan reject ho
@@ -1013,8 +1011,8 @@ func (h *Hub) ReadPump(c *Client) {
 			h.handleResume(c, msg.AuthToken)
 			continue
 		}
-		if msg.Type == "authToken" {
-			h.handleAuthToken(c, msg.AuthToken)
+		if msg.Type == "loginWithToken" {
+			h.handleTokenLogin(c, msg.AuthToken)
 			continue
 		}
 		if msg.Type == "requestPasswordReset" {
