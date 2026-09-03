@@ -253,7 +253,7 @@ func (h *Hub) clearActive(id string, c *Client) {
 // login ho gaya hai, phir uska socket band kar deta hai (agar wo kisi game/queue
 // mein ho to wahan se bhi nikal deta hai).
 func (h *Hub) kickOld(old *Client) {
-	old.sendJSON(ServerMsg{Type: "forceLogout", Message: "aapki ID kisi doosre phone/device par login ho gayi hai — is device se logout kiya ja raha hai"})
+	old.sendJSON(ServerMsg{Type: "forceLogout", Message: "your ID was just logged in on another phone/device — logging out this device"})
 	// Sirf connection band karte hain — ReadPump ka apna defer (LeaveQueue/
 	// LeaveRoom/clearActive) khud chal jayega jaise normal disconnect par hota
 	// hai. Yahan khud LeaveRoom call karna double-forfeiture jaisa bug bana
@@ -268,16 +268,16 @@ func (h *Hub) kickOld(old *Client) {
 // join hi nahi hone dete.
 func (h *Hub) Join(c *Client, mode string, bet int, playerCount int, magic bool) {
 	if bet <= 0 {
-		c.sendJSON(ServerMsg{Type: "error", Message: "bet amount ghalat hai"})
+		c.sendJSON(ServerMsg{Type: "error", Message: "invalid bet amount"})
 		return
 	}
 	coins, err := h.store.GetCoins(c.id)
 	if err != nil {
-		c.sendJSON(ServerMsg{Type: "error", Message: "account nahi mila"})
+		c.sendJSON(ServerMsg{Type: "error", Message: "account not found"})
 		return
 	}
 	if coins < int64(bet) {
-		c.sendJSON(ServerMsg{Type: "error", Message: "coins kam hain is bet ke liye", Coins: coins})
+		c.sendJSON(ServerMsg{Type: "error", Message: "not enough coins for this bet", Coins: coins})
 		return
 	}
 
@@ -354,7 +354,7 @@ func (h *Hub) Join(c *Client, mode string, bet int, playerCount int, magic bool)
 		if dErr != nil {
 			anyFailed = true
 			newBal, _ = h.store.GetCoins(member.id)
-			member.sendJSON(ServerMsg{Type: "error", Message: "bet deduct nahi ho saki: " + dErr.Error(), Coins: newBal})
+			member.sendJSON(ServerMsg{Type: "error", Message: "could not deduct bet: " + dErr.Error(), Coins: newBal})
 			continue
 		}
 		deductedBal[member.color] = newBal
@@ -364,7 +364,7 @@ func (h *Hub) Join(c *Client, mode string, bet int, playerCount int, magic bool)
 		for _, member := range group {
 			if _, ok := deductedBal[member.color]; ok {
 				refunded, _ := h.store.AdjustCoins(member.id, int64(bet))
-				member.sendJSON(ServerMsg{Type: "error", Message: "match cancel ho gaya (ek player ka bet deduct nahi ho saka) — dobara try karein", Coins: refunded})
+				member.sendJSON(ServerMsg{Type: "error", Message: "match cancelled (one player's bet could not be deducted) — please try again", Coins: refunded})
 			}
 			member.mu.Lock()
 			member.room = nil
@@ -463,7 +463,7 @@ func (h *Hub) LeaveRoom(c *Client) {
 
 			newBal, err := h.store.AdjustCoins(winner.id, pot)
 			if err == nil {
-				winner.sendJSON(ServerMsg{Type: "wallet", Color: winner.color, Coins: newBal, Message: "opponent left — aap jeet gaye, pot credit ho gaya"})
+				winner.sendJSON(ServerMsg{Type: "wallet", Color: winner.color, Coins: newBal, Message: "opponent left — you won, pot credited"})
 			}
 			room.timerMu.Lock()
 			if room.timer != nil {
@@ -512,7 +512,7 @@ func (h *Hub) startDisconnectGrace(id string, room *Room, color Color) {
 
 	room.broadcastExcept(color, ServerMsg{
 		Type: "opponentDisconnected", Color: color, Seconds: ReconnectGraceSeconds,
-		Message: "opponent ka connection chala gaya — reconnect hone ka intezaar kar rahe hain",
+		Message: "opponent's connection dropped — waiting for them to reconnect",
 	})
 
 	timer := time.AfterFunc(ReconnectGraceSeconds*time.Second, func() {
@@ -557,7 +557,7 @@ func (h *Hub) finalizeDisconnect(id string, room *Room, color Color) {
 func (h *Hub) handleTokenLogin(c *Client, authToken string) {
 	acc, err := h.store.GetByToken(authToken)
 	if err != nil {
-		c.sendJSON(ServerMsg{Type: "error", Message: "session expire ho chuka — dobara login karein"})
+		c.sendJSON(ServerMsg{Type: "error", Message: "session expired — please log in again"})
 		return
 	}
 	c.mu.Lock()
@@ -581,7 +581,7 @@ func (h *Hub) handleTokenLogin(c *Client, authToken string) {
 func (h *Hub) handleResume(c *Client, authToken string) {
 	acc, err := h.store.GetByToken(authToken)
 	if err != nil {
-		c.sendJSON(ServerMsg{Type: "error", Message: "session expire ho chuka — dobara login karein"})
+		c.sendJSON(ServerMsg{Type: "error", Message: "session expired — please log in again"})
 		return
 	}
 
@@ -592,7 +592,7 @@ func (h *Hub) handleResume(c *Client, authToken string) {
 	}
 	h.mu.Unlock()
 	if !ok {
-		c.sendJSON(ServerMsg{Type: "error", Message: "resume karne ke liye koi active game nahi mili — dobara login karein"})
+		c.sendJSON(ServerMsg{Type: "error", Message: "no active game found to resume — please log in again"})
 		return
 	}
 	if entry.timer != nil {
@@ -610,7 +610,7 @@ func (h *Hub) handleResume(c *Client, authToken string) {
 	room.mu.Unlock()
 	if !stillGoing {
 		// dusri taraf se game khud hi khatam ho chuki (room saaf ho chuka)
-		c.sendJSON(ServerMsg{Type: "error", Message: "yeh game ab active nahi hai"})
+		c.sendJSON(ServerMsg{Type: "error", Message: "this game is no longer active"})
 		return
 	}
 
@@ -696,7 +696,7 @@ func (h *Hub) onTurnTimeout(room *Room, seq int, pending *PendingAction) {
 	if err != nil {
 		return
 	}
-	room.broadcast(ServerMsg{Type: "events", Events: events, State: room.game.Snapshot(), Message: "player inactive tha — server ne uski taraf se auto-play kiya"})
+	room.broadcast(ServerMsg{Type: "events", Events: events, State: room.game.Snapshot(), Message: "player was inactive — server auto-played on their behalf"})
 	h.settleGameOver(room, events)
 	h.armTurnTimer(room)
 }
@@ -721,7 +721,7 @@ func (h *Hub) settleGameOver(room *Room, events []Event) {
 			log.Println("settleGameOver: credit failed:", err)
 			continue
 		}
-		winnerClient.sendJSON(ServerMsg{Type: "wallet", Color: e.Winner, Coins: newBal, Message: "aap jeet gaye! pot credit ho gaya"})
+		winnerClient.sendJSON(ServerMsg{Type: "wallet", Color: e.Winner, Coins: newBal, Message: "you won! pot credited"})
 		room.broadcastExcept(e.Winner, ServerMsg{Type: "wallet", Color: e.Winner, Message: fmt.Sprintf("%s jeet gaya, pot le gaya", e.Winner)})
 	}
 }
@@ -780,13 +780,13 @@ func (h *Hub) handleBuyExtraRoll(c *Client) {
 
 	cost := room.game.NextExtraRollCost(color)
 	if cost == 0 {
-		c.sendJSON(ServerMsg{Type: "error", Message: "is game mein reroll ki 1000 diamond limit khatam ho chuki — lock ho gaya"})
+		c.sendJSON(ServerMsg{Type: "error", Message: "reroll's 1000-diamond limit reached for this game — locked"})
 		return
 	}
 
 	newDiamonds, err := h.store.AdjustDiamonds(c.id, -cost)
 	if err != nil {
-		c.sendJSON(ServerMsg{Type: "error", Message: "diamonds kam hain extra-roll ke liye"})
+		c.sendJSON(ServerMsg{Type: "error", Message: "not enough diamonds for a reroll"})
 		return
 	}
 
@@ -798,7 +798,7 @@ func (h *Hub) handleBuyExtraRoll(c *Client) {
 		return
 	}
 
-	c.sendJSON(ServerMsg{Type: "wallet", Diamonds: newDiamonds, Message: "extra roll khareeda"})
+	c.sendJSON(ServerMsg{Type: "wallet", Diamonds: newDiamonds, Message: "reroll purchased"})
 	room.broadcast(ServerMsg{Type: "events", Events: events, State: room.game.Snapshot()})
 	h.settleGameOver(room, events)
 	h.armTurnTimer(room)
@@ -810,11 +810,11 @@ func (h *Hub) handleBuyExtraRoll(c *Client) {
 // nahi lagti, sab isi socket ke andar.
 func (h *Hub) handleSignup(c *Client, email, password string) {
 	if email == "" || password == "" {
-		c.sendJSON(ServerMsg{Type: "error", Message: "email aur password dono zaroori hain"})
+		c.sendJSON(ServerMsg{Type: "error", Message: "email and password are both required"})
 		return
 	}
 	if len(password) < 6 {
-		c.sendJSON(ServerMsg{Type: "error", Message: "password kam se kam 6 characters ka ho"})
+		c.sendJSON(ServerMsg{Type: "error", Message: "password must be at least 6 characters"})
 		return
 	}
 	acc, token, err := h.store.SignUp(email, password)
@@ -867,17 +867,17 @@ func (h *Hub) handleLogin(c *Client, email, password string) {
 func (h *Hub) handleRequestPasswordReset(c *Client, email string) {
 	email = normalizeEmail(email)
 	if email == "" {
-		c.sendJSON(ServerMsg{Type: "error", Message: "email zaroori hai"})
+		c.sendJSON(ServerMsg{Type: "error", Message: "email is required"})
 		return
 	}
 	if _, err := h.store.GetIDByEmail(email); err != nil {
 		// Jaan-boojh kar wahi generic success jaisa jawab — email enumeration na ho.
-		c.sendJSON(ServerMsg{Type: "otpSent", Message: "agar yeh email registered hai to verification code bhej diya gaya hai"})
+		c.sendJSON(ServerMsg{Type: "otpSent", Message: "if this email is registered, a verification code has been sent"})
 		return
 	}
 	otp, err := h.otps.Issue(email)
 	if err != nil {
-		c.sendJSON(ServerMsg{Type: "error", Message: "code generate nahi ho saka, dobara try karein"})
+		c.sendJSON(ServerMsg{Type: "error", Message: "could not generate code, please try again"})
 		return
 	}
 	go func() {
@@ -885,7 +885,7 @@ func (h *Hub) handleRequestPasswordReset(c *Client, email string) {
 			log.Println("sendOtpEmail failed:", sendErr)
 		}
 	}()
-	c.sendJSON(ServerMsg{Type: "otpSent", Message: "agar yeh email registered hai to verification code bhej diya gaya hai"})
+	c.sendJSON(ServerMsg{Type: "otpSent", Message: "if this email is registered, a verification code has been sent"})
 }
 
 // handleResetPassword — "Forgot Password" ka final step. Ab OTP ka asal
@@ -896,15 +896,15 @@ func (h *Hub) handleRequestPasswordReset(c *Client, email string) {
 func (h *Hub) handleResetPassword(c *Client, email, newPassword, otp string) {
 	email = normalizeEmail(email)
 	if email == "" || newPassword == "" || otp == "" {
-		c.sendJSON(ServerMsg{Type: "error", Message: "email, naya password aur verification code teeno zaroori hain"})
+		c.sendJSON(ServerMsg{Type: "error", Message: "email, new password, and verification code are all required"})
 		return
 	}
 	if len(newPassword) < 6 {
-		c.sendJSON(ServerMsg{Type: "error", Message: "password kam se kam 6 characters ka ho"})
+		c.sendJSON(ServerMsg{Type: "error", Message: "password must be at least 6 characters"})
 		return
 	}
 	if !h.otps.Verify(email, otp) {
-		c.sendJSON(ServerMsg{Type: "error", Message: "verification code ghalat ya expire ho chuka hai — dobara code mangwayein"})
+		c.sendJSON(ServerMsg{Type: "error", Message: "verification code is incorrect or expired — please request a new code"})
 		return
 	}
 	acc, token, err := h.store.ResetPassword(email, newPassword)
@@ -927,7 +927,7 @@ func (h *Hub) handleResetPassword(c *Client, email, newPassword, otp string) {
 func (h *Hub) handleUpdateProfile(c *Client, name, avatar string) {
 	name = strings.TrimSpace(name)
 	if name == "" {
-		c.sendJSON(ServerMsg{Type: "error", Message: "naam khali nahi ho sakta"})
+		c.sendJSON(ServerMsg{Type: "error", Message: "name cannot be empty"})
 		return
 	}
 	if len(name) > 16 {
@@ -935,16 +935,16 @@ func (h *Hub) handleUpdateProfile(c *Client, name, avatar string) {
 	}
 	if avatar != "" {
 		if strings.HasPrefix(avatar, "data:") || len(avatar) > 500 {
-			c.sendJSON(ServerMsg{Type: "error", Message: "avatar sirf ek image URL ho sakta hai (base64 allowed nahi) — pehle POST /avatar par photo upload karein, phir wapis mila hua URL yahan bhejein"})
+			c.sendJSON(ServerMsg{Type: "error", Message: "avatar must be an image URL (base64 not allowed) — first upload the photo via POST /avatar, then send the returned URL here"})
 			return
 		}
 		if !strings.HasPrefix(avatar, "http://") && !strings.HasPrefix(avatar, "https://") {
-			c.sendJSON(ServerMsg{Type: "error", Message: "avatar ek valid http(s) URL hona chahiye"})
+			c.sendJSON(ServerMsg{Type: "error", Message: "avatar must be a valid http(s) URL"})
 			return
 		}
 	}
 	if err := h.store.UpdateProfile(c.id, name, avatar); err != nil {
-		c.sendJSON(ServerMsg{Type: "error", Message: "profile save nahi ho saka"})
+		c.sendJSON(ServerMsg{Type: "error", Message: "could not save profile"})
 		return
 	}
 	c.mu.Lock()
@@ -1028,7 +1028,7 @@ func (h *Hub) ReadPump(c *Client) {
 		authed := c.authed
 		c.mu.Unlock()
 		if !authed {
-			c.sendJSON(ServerMsg{Type: "error", Message: "pehle signup ya login karein"})
+			c.sendJSON(ServerMsg{Type: "error", Message: "please sign up or log in first"})
 			continue
 		}
 

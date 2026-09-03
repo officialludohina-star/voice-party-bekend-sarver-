@@ -115,7 +115,7 @@ func (s *Store) SignUp(email, password string) (Account, string, error) {
 		id, email, string(hash), name, "", SignupBonusCoins, SignupBonusDiamonds, token, now.Format(time.RFC3339),
 	)
 	if err != nil {
-		return Account{}, "", errors.New("yeh email pehle se registered hai")
+		return Account{}, "", errors.New("this email is already registered")
 	}
 	return Account{ID: id, Email: email, Name: name, Coins: SignupBonusCoins, Diamonds: SignupBonusDiamonds, CreatedAt: now}, token, nil
 }
@@ -126,7 +126,7 @@ func (s *Store) GetIDByEmail(email string) (string, error) {
 	var id string
 	err := s.db.QueryRow(`SELECT id FROM accounts WHERE email = ?`, normalizeEmail(email)).Scan(&id)
 	if err != nil {
-		return "", errors.New("is email se koi account registered nahi hai")
+		return "", errors.New("no account registered with this email")
 	}
 	return id, nil
 }
@@ -138,10 +138,10 @@ func (s *Store) Login(email, password string) (Account, string, error) {
 	var coins, diamonds int64
 	row := s.db.QueryRow(`SELECT id, password_hash, coins, diamonds, created_at, name, avatar FROM accounts WHERE email = ?`, email)
 	if err := row.Scan(&id, &hash, &coins, &diamonds, &createdAt, &name, &avatar); err != nil {
-		return Account{}, "", errors.New("email ya password ghalat hai")
+		return Account{}, "", errors.New("invalid email or password")
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)); err != nil {
-		return Account{}, "", errors.New("email ya password ghalat hai")
+		return Account{}, "", errors.New("invalid email or password")
 	}
 	token, err := randomHex(24)
 	if err != nil {
@@ -178,7 +178,7 @@ func (s *Store) ResetPassword(email, newPassword string) (Account, string, error
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return Account{}, "", errors.New("is email se koi account registered nahi hai")
+		return Account{}, "", errors.New("no account registered with this email")
 	}
 	var id, name, avatar, createdAt string
 	var coins, diamonds int64
@@ -203,7 +203,7 @@ func (s *Store) GetByToken(token string) (Account, error) {
 	var coins, diamonds int64
 	row := s.db.QueryRow(`SELECT id, email, coins, diamonds, created_at, name, avatar FROM accounts WHERE token = ?`, token)
 	if err := row.Scan(&id, &email, &coins, &diamonds, &createdAt, &name, &avatar); err != nil {
-		return Account{}, errors.New("invalid ya expired token — dobara login karein")
+		return Account{}, errors.New("invalid or expired token — please log in again")
 	}
 	t, _ := time.Parse(time.RFC3339, createdAt)
 	return Account{ID: id, Email: email, Name: name, Avatar: avatar, Coins: coins, Diamonds: diamonds, CreatedAt: t}, nil
