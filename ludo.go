@@ -55,25 +55,43 @@ const ArrowHeadOffset = 5
 const ArrowEdgeEntryRel = 51
 const QuickBlockRel = 46
 
+// ==== Magic cells (Golden Dice + Rocket) — ab FIXED hain ====
+// Pehle har naye game mein yeh 6 cells random shuffle se chuni jati thi,
+// isliye har match/room mein alag jagah par hoti thin. Ab hamesha yehi
+// 6 global ring-cells (0-51) use hoti hain — har game mein, har room mein
+// consistent — taake players seekh sakein ke Golden Dice/Rocket hamesha
+// kahan milte hain. Yeh cells jaan-boojh kar kisi bhi color ke arrow
+// tail/head (4,5,17,18,30,31,43,44) se hat kar rakhi gayi hain taake
+// Arrow+Magic combo mein clash na ho.
+var MagicDiceCellsFixed = []int{3, 20, 37}
+var MagicRocketCellsFixed = []int{12, 29, 46}
+
 // ==== Extra Dice Roll (diamonds se khareedi jati hai) ====
-// Pehle purchase ki cost 2 diamonds, phir 4, 8, 10, 16, 24 — is ke baad har
-// agli purchase pichli se double hoti jati hai. Har player apne is game mein
-// total 1000 diamonds tak hi extra-roll khareed sakta hai, us ke baad lock ho
-// jata hai (naya game shuru hote hi dobara se shuru ho jata hai).
-var ExtraRollCosts = []int64{2, 4, 8, 10, 16, 24}
+// Pehle purchase ki cost 2 diamonds, phir 4, 6, 10, 16, 22, 30 — is ke baad
+// bhi cost isi rafta se (aakhri do cost ka farq, yani +8) thora thora karke
+// badhti rehti hai — koi doubling nahi, sirf slow-steady growth (38, 46, 54,
+// 62, ...). Har player apne is game mein total 1000 diamonds tak hi
+// extra-roll khareed sakta hai, us ke baad lock ho jata hai (naya game
+// shuru hote hi dobara se shuru ho jata hai).
+var ExtraRollCosts = []int64{2, 4, 6, 10, 16, 22, 30}
 
 const ExtraRollGameCap int64 = 1000
+
+// ExtraRollTurnLimit — ek hi turn (six-streak ke connected rolls samet) ke
+// andar player zyada se zyada itni baar extra-roll khareed sakta hai. Is se
+// aage 4th purchase us turn ke liye lock ho jata hai — jab agli baar us
+// player ki bari aati hai to yeh counter phir se 0 se shuru hota hai.
+const ExtraRollTurnLimit = 3
 
 func nextExtraRollCost(count int) int64 {
 	if count < len(ExtraRollCosts) {
 		return ExtraRollCosts[count]
 	}
-	cost := ExtraRollCosts[len(ExtraRollCosts)-1]
-	steps := count - len(ExtraRollCosts) + 1
-	for i := 0; i < steps; i++ {
-		cost *= 2
-	}
-	return cost
+	last := ExtraRollCosts[len(ExtraRollCosts)-1]
+	prev := ExtraRollCosts[len(ExtraRollCosts)-2]
+	step := last - prev // = 8, aakhri do defined cost ka farq
+	extraSteps := int64(count - len(ExtraRollCosts) + 1)
+	return last + extraSteps*step
 }
 
 // har color ka apna exit-arm tail cell (global ring index)
@@ -110,6 +128,10 @@ type Event struct {
 	FinishOrder []Color          `json:"finishOrder,omitempty"`
 	RankBadge   map[Color]int    `json:"rankBadge,omitempty"`
 	Message     string           `json:"message,omitempty"`
+	// JointTokenIndex — Master mode: agar yeh "move" event ek joint pair ka
+	// tha to yahan partner token ka index milta hai (wo bhi TokenIndex ke sath
+	// bilkul isi "To" position par move hua). Non-joint moves mein omit hota hai.
+	JointTokenIndex *int `json:"jointTokenIndex,omitempty"`
 }
 
 type GameState struct {
@@ -145,6 +167,18 @@ type GameState struct {
 	// kiye aur kitni dafa khareeda — 1000 diamond cap yahan se track hoti hai.
 	ExtraRollSpent map[Color]int64
 	ExtraRollCount map[Color]int
+
+	// ExtraRollTurnCount — isi player ke CURRENT turn ke andar (six-streak ke
+	// connected rolls samet) ab tak kitni baar extra-roll khareedi ja chuki hai.
+	// ExtraRollTurnLimit (3) tak pohanchte hi is turn ke liye lock ho jata hai;
+	// advanceTurn() naye turn ki shuruwat par isay 0 par reset kar deta hai.
+	ExtraRollTurnCount map[Color]int
+
+	// HasKilled — Quick mode ka "Kill to Enter Home" rule: is color ne is game
+	// mein ab tak kam se kam ek opponent token maara hai ya nahi. Jab tak yeh
+	// true na ho, is color ka koi bhi token ending track (position 51-56) mein
+	// nahi ja sakta — captureAtCell mein set hota hai.
+	HasKilled map[Color]bool
 }
 
 func NewGameState(mode Mode, players []Color, magicOn bool) *GameState {
@@ -156,32 +190,25 @@ func NewGameState(mode Mode, players []Color, magicOn bool) *GameState {
 		DiceByColor:    map[Color]int{},
 		bonusSix:       map[Color]bool{},
 		RankBadge:      map[Color]int{},
-		ExtraRollSpent: map[Color]int64{},
-		ExtraRollCount: map[Color]int{},
+		ExtraRollSpent:     map[Color]int64{},
+		ExtraRollCount:     map[Color]int{},
+		ExtraRollTurnCount: map[Color]int{},
+		HasKilled:          map[Color]bool{},
 	}
 	for _, c := range players {
-		g.Tokens[c] = [4]int{-1, -1, -1, -1}
+		if mode == ModeQuick {
+			// "Different Start" — Quick mode mein har color ka EK token game
+			// shuru hote hi apne start square (relative position 0) par pehle
+			// se hi hota hai, baaki teen nest (-1) mein rehte hain.
+			g.Tokens[c] = [4]int{0, -1, -1, -1}
+		} else {
+			g.Tokens[c] = [4]int{-1, -1, -1, -1}
+		}
 		g.DiceByColor[c] = 1
 	}
 	if magicOn {
-		arrowRelated := map[int]bool{}
-		for c := range arrowTails {
-			arrowRelated[c] = true
-		}
-		for _, p := range players {
-			arrowRelated[arrowHeadFor(p)] = true
-		}
-		var pool []int
-		for i := 0; i <= 51; i++ {
-			if !arrowRelated[i] {
-				pool = append(pool, i)
-			}
-		}
-		rand.Shuffle(len(pool), func(i, j int) { pool[i], pool[j] = pool[j], pool[i] })
-		if len(pool) >= 6 {
-			g.MagicDiceCells = append([]int{}, pool[:3]...)
-			g.MagicRocketCells = append([]int{}, pool[3:6]...)
-		}
+		g.MagicDiceCells = append([]int{}, MagicDiceCellsFixed...)
+		g.MagicRocketCells = append([]int{}, MagicRocketCellsFixed...)
 	}
 	return g
 }
@@ -299,16 +326,33 @@ func (g *GameState) RollDice(requester Color) ([]Event, error) {
 }
 
 // NextExtraRollCost — is player ke agle extra-roll ki diamond price. Agar is
-// game mein us player ki 1000 diamond ki limit khatam ho chuki ho to 0 wapis
-// karta hai (matlab lock ho chuka, aur extra-roll nahi khareed sakta).
+// game mein us player ki 1000 diamond ki limit khatam ho chuki ho, YA is
+// current turn mein 3 extra-roll pehle hi khareed chuka ho, to 0 wapis karta
+// hai (matlab abhi lock hai, aur extra-roll nahi khareed sakta).
 func (g *GameState) NextExtraRollCost(c Color) int64 {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	return g.nextExtraRollCostLocked(c)
+}
+
+func (g *GameState) nextExtraRollCostLocked(c Color) int64 {
+	if g.ExtraRollTurnCount[c] >= ExtraRollTurnLimit {
+		return 0
+	}
 	cost := nextExtraRollCost(g.ExtraRollCount[c])
 	if g.ExtraRollSpent[c]+cost > ExtraRollGameCap {
 		return 0
 	}
 	return cost
+}
+
+// ExtraRollTurnLocked — batata hai ke kya yeh player abhi sirf isi turn ki
+// 3-purchase limit ki wajah se lock hai (total 1000-diamond cap alag cheez
+// hai) — hub.go isay use kar ke sahi error message dikhata hai.
+func (g *GameState) ExtraRollTurnLocked(c Color) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.ExtraRollTurnCount[c] >= ExtraRollTurnLimit
 }
 
 // BuyExtraRoll — diamonds pehle hi (hub.go mein) deduct ho chuke hote hain,
@@ -327,10 +371,14 @@ func (g *GameState) BuyExtraRoll(requester Color, cost int64) ([]Event, error) {
 	if time.Since(g.LastRollAt) > RerollWindowSeconds*time.Second {
 		return nil, errors.New("reroll ka 3-second window khatam ho chuka — is roll ke liye ab dobara nahi guma saktay")
 	}
+	if g.ExtraRollTurnCount[requester] >= ExtraRollTurnLimit {
+		return nil, errors.New("is turn mein extra-roll ki 3 ki limit khatam ho chuki — agli bari par phir se mil jayegi")
+	}
 
 	color := requester
 	g.ExtraRollSpent[color] += cost
 	g.ExtraRollCount[color]++
+	g.ExtraRollTurnCount[color]++
 
 	// Pichla (abhi tak apply na hua) roll discard kar dein — yeh REPLACE hai,
 	// naya roll iske upar "extra" ban kar add nahi hota. Agar player ne is
@@ -367,15 +415,112 @@ func (g *GameState) BuyExtraRoll(requester Color, cost int64) ([]Event, error) {
 	return events, nil
 }
 
+// canEnterHomeStretch — "Kill to Enter Home" rule: is color ke liye position
+// 50 se aage (ending track, 51-56) mein tabhi jaya ja sakta hai jab is color ne
+// is game mein kam se kam ek opponent token maara ho. Quick aur Master dono
+// modes mein yeh rule lagta hai (Master ke rules screenshot mein "KILL TO
+// ENTER HOME" isi ka naam hai); Classic/Arrow mein yeh apply nahi hota.
+func (g *GameState) canEnterHomeStretch(c Color) bool {
+	if g.Mode != ModeQuick && g.Mode != ModeMaster {
+		return true
+	}
+	return g.HasKilled[c]
+}
+
+// ==== Master mode — "Joint Tokens" ====
+// Jab kisi color ke 2 tokens ek hi (non-safe) ring cell par khare ho jayein
+// to wo "joint" ban jate hain aur ek roadblock ki tarah kaam karte hain
+// (opponent ka koi akela token unhein maar nahi sakta — bilkul wahi purani
+// "block" wali logic jo captureAtCell mein pehle se hai). Master mode mein
+// is joint jode ke apne khaas move-rules hain (neeche dekhein), aur safe
+// square par pohanchte hi wo khud-b-khud separate ho jate hain — isliye
+// "joint" hone ka status kahin alag se store nahi karte, balke hamesha
+// current positions se hi nikalte hain (masterJointPairs).
+
+// masterJointPairs — is color ke liye token-index -> uske "joint partner" ka
+// index. Sirf Master mode mein kaam karta hai; baaki modes mein hamesha khaali
+// map deta hai. Ek waqt mein sirf ek hi pair consider hota hai (do token ek
+// jagah) — teen/chaar tokens ek hi cell par ikattha hona bohot rare edge case
+// hai aur abhi is model mein sirf pehla pair joint mana jata hai.
+func (g *GameState) masterJointPairs(c Color) map[int]int {
+	pairs := map[int]int{}
+	if g.Mode != ModeMaster {
+		return pairs
+	}
+	t := g.Tokens[c]
+	byPos := map[int][]int{}
+	for i, p := range t {
+		if p < 0 || p > 50 {
+			continue // yard ya ending-track ke token kabhi joint nahi hote
+		}
+		if SafeSet[g.globalCellOf(c, p)] {
+			continue // safe square par joint tokens turant separate ho jate hain
+		}
+		byPos[p] = append(byPos[p], i)
+	}
+	for _, idxs := range byPos {
+		if len(idxs) >= 2 {
+			pairs[idxs[0]] = idxs[1]
+			pairs[idxs[1]] = idxs[0]
+		}
+	}
+	return pairs
+}
+
+// jointPairsList — masterJointPairs ko [[i,j], ...] unique pairs ki list mein
+// convert karta hai, Snapshot mein client ko bhejne ke liye.
+func (g *GameState) jointPairsList(c Color) [][2]int {
+	pairs := g.masterJointPairs(c)
+	seen := map[int]bool{}
+	var out [][2]int
+	for i, j := range pairs {
+		if seen[i] || seen[j] {
+			continue
+		}
+		seen[i] = true
+		seen[j] = true
+		out = append(out, [2]int{i, j})
+	}
+	return out
+}
+
 func (g *GameState) computeMovable(c Color, dv int) []int {
 	t := g.Tokens[c]
+	joints := g.masterJointPairs(c)
+	seenJointPos := map[int]bool{}
 	var result []int
 	for i, p := range t {
 		if p == -1 {
 			if dv == 6 {
 				result = append(result, i)
 			}
-		} else if p+dv <= 56 {
+			continue
+		}
+		if _, isJoint := joints[i]; isJoint {
+			// Master mode "Moving Joint Tokens" rule: sirf EVEN roll par move
+			// hote hain, wo bhi roll ki AADHI value se. Pair ki taraf se sirf
+			// ek hi movable-slot banta hai (chota index leader ke taur par).
+			if seenJointPos[p] {
+				continue
+			}
+			seenJointPos[p] = true
+			if dv%2 != 0 {
+				continue
+			}
+			newPos := p + dv/2
+			if newPos > 56 {
+				continue
+			}
+			if p <= 50 && newPos > 50 && !g.canEnterHomeStretch(c) {
+				continue
+			}
+			result = append(result, i)
+			continue
+		}
+		if p+dv <= 56 {
+			if p <= 50 && p+dv > 50 && !g.canEnterHomeStretch(c) {
+				continue // Quick/Master: bina kill kiye ending track mein nahi ja sakta
+			}
 			result = append(result, i)
 		}
 	}
@@ -385,12 +530,34 @@ func (g *GameState) computeMovable(c Color, dv int) []int {
 func (g *GameState) legalRollsForToken(c Color, tokenIdx int) []int {
 	pos := g.Tokens[c][tokenIdx]
 	var legal []int
+
+	if _, isJoint := g.masterJointPairs(c)[tokenIdx]; isJoint {
+		// Joint pair: sirf even rolls legal hain, wo bhi aadhi value se.
+		for i, dv := range g.SavedRolls {
+			if dv%2 != 0 {
+				continue
+			}
+			newPos := pos + dv/2
+			if newPos > 56 {
+				continue
+			}
+			if pos <= 50 && newPos > 50 && !g.canEnterHomeStretch(c) {
+				continue
+			}
+			legal = append(legal, i)
+		}
+		return legal
+	}
+
 	for i, dv := range g.SavedRolls {
 		if pos == -1 {
 			if dv == 6 {
 				legal = append(legal, i)
 			}
 		} else if pos+dv <= 56 {
+			if pos <= 50 && pos+dv > 50 && !g.canEnterHomeStretch(c) {
+				continue // Quick/Master: bina kill kiye ending track mein nahi ja sakta
+			}
 			legal = append(legal, i)
 		}
 	}
@@ -550,7 +717,12 @@ func (g *GameState) relocateMagicCell(list *[]int, usedIdx int) {
 	}
 }
 
-func (g *GameState) captureAtCell(c Color, cell int) []Color {
+// captureAtCell — moverIsJoint sirf Master mode mein maayne rakhta hai: agar
+// yeh move khud ek joint pair ka tha, to opponent ka 2+ tokens wala roadblock
+// bhi toot (kill ho) sakta hai — "Only joint tokens can kill joint tokens"
+// rule. Baaki har jagah (moverIsJoint=false, ya kisi aur mode mein) 2+ wala
+// block hamesha ki tarah uncapturable rehta hai.
+func (g *GameState) captureAtCell(c Color, cell int, moverIsJoint bool) []Color {
 	isArrowSpot := false
 	if g.Mode == ModeArrow {
 		if arrowTails[cell] {
@@ -584,7 +756,9 @@ func (g *GameState) captureAtCell(c Color, cell int) []Color {
 	var captured []Color
 	for oc, idxs := range byColor {
 		if len(idxs) >= 2 {
-			continue // block — kabhi kill nahi hoti
+			if !(g.Mode == ModeMaster && moverIsJoint) {
+				continue // block — sirf ek doosra joint pair hi isay tod sakta hai
+			}
 		}
 		ot := g.Tokens[oc]
 		for _, j := range idxs {
@@ -592,6 +766,11 @@ func (g *GameState) captureAtCell(c Color, cell int) []Color {
 		}
 		g.Tokens[oc] = ot
 		captured = append(captured, oc)
+	}
+	if len(captured) > 0 {
+		// Quick mode ka "Kill to Enter Home" rule — is color ne ab kam se kam
+		// ek kill kar li, ab is ke tokens ending track mein ja sakte hain.
+		g.HasKilled[c] = true
 	}
 	return captured
 }
@@ -601,9 +780,19 @@ func (g *GameState) captureAtCell(c Color, cell int) []Color {
 func (g *GameState) performMove(tokenIdx int, dv int) (bool, []Event) {
 	color := g.CurrentColor()
 	t := g.Tokens[color]
+
+	// Master mode: agar yeh token abhi kisi doosre token ke sath "joint" hai
+	// to move dv ki AADHI value se hota hai aur partner token bhi sath move
+	// hota hai (dono ek sath, ek hi naye position par).
+	partnerIdx, isJointMove := g.masterJointPairs(color)[tokenIdx]
+	moveAmount := dv
+	if isJointMove {
+		moveAmount = dv / 2
+	}
+
 	wasInYard := t[tokenIdx] == -1
 	from := t[tokenIdx]
-	newPos := t[tokenIdx] + dv
+	newPos := t[tokenIdx] + moveAmount
 	if wasInYard {
 		newPos = 0
 	}
@@ -634,7 +823,7 @@ func (g *GameState) performMove(tokenIdx int, dv int) (bool, []Event) {
 
 		if newPos <= 50 {
 			gc := g.globalCellOf(color, newPos)
-			if caps := g.captureAtCell(color, gc); len(caps) > 0 {
+			if caps := g.captureAtCell(color, gc, isJointMove); len(caps) > 0 {
 				captured = append(captured, caps...)
 			}
 		}
@@ -646,7 +835,9 @@ func (g *GameState) performMove(tokenIdx int, dv int) (bool, []Event) {
 				magicBonus = true
 				g.relocateMagicCell(&g.MagicDiceCells, gc)
 			} else if containsInt(g.MagicRocketCells, gc) {
-				boost := rand.Intn(15) + 1
+				// Rocket rule: "no more than 8 squares" — random 1-8 (pehle
+				// galti se 1-15 tha).
+				boost := rand.Intn(8) + 1
 				maxAdd := boost
 				if 56-newPos < maxAdd {
 					maxAdd = 56 - newPos
@@ -669,7 +860,7 @@ func (g *GameState) performMove(tokenIdx int, dv int) (bool, []Event) {
 				}
 				if newPos <= 50 {
 					gc3 := g.globalCellOf(color, newPos)
-					if caps := g.captureAtCell(color, gc3); len(caps) > 0 {
+					if caps := g.captureAtCell(color, gc3, isJointMove); len(caps) > 0 {
 						captured = append(captured, caps...)
 					}
 				}
@@ -678,10 +869,14 @@ func (g *GameState) performMove(tokenIdx int, dv int) (bool, []Event) {
 	}
 
 	t[tokenIdx] = newPos
+	if isJointMove {
+		// Joint pair — partner token bhi bilkul isi naye position par jata hai.
+		t[partnerIdx] = newPos
+	}
 	g.Tokens[color] = t
 	reachedHome := newPos == 56
 
-	events := []Event{{
+	moveEvent := Event{
 		Type:        "move",
 		Color:       color,
 		TokenIndex:  tokenIdx,
@@ -691,7 +886,12 @@ func (g *GameState) performMove(tokenIdx int, dv int) (bool, []Event) {
 		ArrowJumped: arrowJumped,
 		MagicBonus:  magicBonus,
 		ReachedHome: reachedHome,
-	}}
+	}
+	if isJointMove {
+		p := partnerIdx
+		moveEvent.JointTokenIndex = &p
+	}
+	events := []Event{moveEvent}
 
 	if g.checkWin(color) {
 		events = append(events, Event{
@@ -782,6 +982,10 @@ func (g *GameState) advanceTurn(extra bool) []Event {
 		}
 		g.CurrentIdx = next
 		g.sixStreak = 0
+		// Naye player ki bari shuru — is player ka extra-roll turn-counter
+		// (pichli baar jab is ki bari thi) reset kar dein taake usay phir se
+		// 3 fresh extra-roll milein.
+		g.ExtraRollTurnCount[g.CurrentColor()] = 0
 	}
 	return []Event{{Type: "turn", Color: g.CurrentColor()}}
 }
@@ -805,6 +1009,10 @@ type Snapshot struct {
 	MagicRocketCells []int            `json:"magicRocketCells,omitempty"`
 	ExtraRollNextCost map[Color]int64 `json:"extraRollNextCost,omitempty"`
 	ExtraRollSpent    map[Color]int64 `json:"extraRollSpent,omitempty"`
+	// JointTokens — Master mode: har color ke abhi ke joint pairs (token-index
+	// jode ki list), taake client bina khud hisaab lagaye unhein ek roadblock
+	// ki tarah dikha sake. Baaki modes mein hamesha khaali/omit rehta hai.
+	JointTokens map[Color][][2]int `json:"jointTokens,omitempty"`
 }
 
 func (g *GameState) Snapshot() *Snapshot {
@@ -813,11 +1021,19 @@ func (g *GameState) Snapshot() *Snapshot {
 
 	nextCost := map[Color]int64{}
 	for _, c := range g.Players {
-		cost := nextExtraRollCost(g.ExtraRollCount[c])
-		if g.ExtraRollSpent[c]+cost > ExtraRollGameCap {
-			cost = 0 // 0 = is game mein is player ke liye lock ho chuka
+		// 0 = abhi is player ke liye lock hai — ya to isi turn ki 3-purchase
+		// limit ki wajah se, ya poore game ke 1000-diamond cap ki wajah se.
+		nextCost[c] = g.nextExtraRollCostLocked(c)
+	}
+
+	var jointTokens map[Color][][2]int
+	if g.Mode == ModeMaster {
+		jointTokens = map[Color][][2]int{}
+		for _, c := range g.Players {
+			if pairs := g.jointPairsList(c); len(pairs) > 0 {
+				jointTokens[c] = pairs
+			}
 		}
-		nextCost[c] = cost
 	}
 
 	return &Snapshot{
@@ -837,5 +1053,6 @@ func (g *GameState) Snapshot() *Snapshot {
 		MagicRocketCells:  g.MagicRocketCells,
 		ExtraRollNextCost: nextCost,
 		ExtraRollSpent:    g.ExtraRollSpent,
+		JointTokens:       jointTokens,
 	}
 }

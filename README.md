@@ -74,12 +74,22 @@ socket connection tak hi rehta hai).
   sakta hai, cost server khud nikal leta hai
 
 ### Extra Dice Roll (diamonds se)
-Har player apni **pehli extra-roll ke 2 diamonds**, phir 4, 8, 10, 16, 24 —
-is ke baad har agli purchase pichli se **double** hoti jati hai. Ek player
+Har player apni **pehli extra-roll ke 2 diamonds**, phir 4, 6, 10, 16, 22, 30
+— is ke baad bhi cost isi rafta se (+8 karke) thora thora badhti rehti hai:
+38, 46, 54, 62... **koi doubling nahi**, sirf slow-steady growth. Ek player
 apne **ek game mein total 1000 diamonds** tak hi extra-roll khareed sakta hai
-— us ke baad lock ho jata hai (naya game shuru hote hi dobara 2 diamonds se
-shuru). Snapshot ke `extraRollNextCost` field mein har color ki agli cost
-milti hai — `0` ka matlab hai us player ke liye is game mein lock ho chuka.
+(is rafta se lagbhag 18 purchases mein cap aati hai) — us ke baad lock ho
+jata hai (naya game shuru hote hi dobara 2 diamonds se shuru).
+
+**Per-turn limit:** ek hi turn ke andar (six-streak ke connected rolls samet)
+player zyada se zyada **3 extra-roll** khareed sakta hai — 4th baar us turn
+ke liye lock ho jata hai. Jab agli baar us player ki bari aati hai to yeh
+counter phir se 0 se shuru ho jata hai (poore-game wala 1000-diamond cap
+alag se, bina reset hue, chalta rehta hai).
+
+Snapshot ke `extraRollNextCost` field mein har color ki agli cost milti hai —
+`0` ka matlab hai us player ke liye abhi lock hai (isi turn ki 3-purchase
+limit ki wajah se, ya poore-game 1000-diamond cap ki wajah se).
 
 ### Server → Client messages
 ```json

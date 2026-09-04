@@ -780,7 +780,11 @@ func (h *Hub) handleBuyExtraRoll(c *Client) {
 
 	cost := room.game.NextExtraRollCost(color)
 	if cost == 0 {
-		c.sendJSON(ServerMsg{Type: "error", Message: "reroll's 1000-diamond limit reached for this game — locked"})
+		msg := "reroll's 1000-diamond limit reached for this game — locked"
+		if room.game.ExtraRollTurnLocked(color) {
+			msg = "is turn mein extra-roll ki 3 ki limit khatam ho chuki — agli bari par phir se mil jayegi"
+		}
+		c.sendJSON(ServerMsg{Type: "error", Message: msg})
 		return
 	}
 
